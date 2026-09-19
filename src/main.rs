@@ -5,7 +5,7 @@ use los_cara::config;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "los-cara", about = "S3-compatible object storage server")]
+#[command(name = "lc", about = "S3-compatible object storage server")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,

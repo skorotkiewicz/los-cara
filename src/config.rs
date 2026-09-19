@@ -57,7 +57,7 @@ pub async fn serve(
 
     match (tls_cert, tls_key) {
         (Some(cert), Some(key)) => {
-            tracing::info!("los-cara listening on https://{addr}");
+            tracing::info!("lc listening on https://{addr}");
             let rustls_config = match load_tls(&cert, &key) {
                 Ok(c) => c,
                 Err(e) => {
@@ -72,7 +72,7 @@ pub async fn serve(
         }
         _ => {
             let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
-            tracing::info!("los-cara listening on http://{addr}");
+            tracing::info!("lc listening on http://{addr}");
             axum::serve(listener, app).await.expect("server error");
         }
     }

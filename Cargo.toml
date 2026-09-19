@@ -3,6 +3,10 @@ name = "los-cara"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "lc"
+path = "src/main.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["http1"] }
