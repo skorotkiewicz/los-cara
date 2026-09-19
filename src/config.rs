@@ -5,13 +5,6 @@ use crate::s3::{self, AppState};
 use crate::storage::Storage;
 use std::path::Path;
 
-fn install_crypto_provider() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
-}
-
 pub fn add_key(data_dir: &Path, access_key: &str, secret_key: &str) {
     auth::add_key(data_dir, access_key, secret_key);
 }

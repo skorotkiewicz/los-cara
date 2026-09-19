@@ -311,7 +311,6 @@ impl Storage {
         let mut sha = Sha256::new();
         let mut size: u64 = 0;
 
-        let mut stream_failed = false;
         while let Some(chunk) = body.next().await {
             match chunk {
                 Ok(chunk) => {
@@ -329,12 +328,10 @@ impl Storage {
                 }
                 Err(e) => {
                     let _ = fs::remove_file(&tmp_path).await;
-                    stream_failed = true;
                     return Err(e);
                 }
             }
         }
-        let _ = stream_failed;
         file.flush()
             .await
             .map_err(|e| S3Error::internal(e.to_string()))?;
@@ -786,7 +783,7 @@ impl Storage {
         upload_id: &str,
         listed: &[(u32, String)],
     ) -> Result<ObjectMeta, S3Error> {
-        let mut m = self.load_manifest(upload_id).await?;
+        let m = self.load_manifest(upload_id).await?;
         let _guard = self.object_lock(&m.bucket, &m.key).await;
 
         // validate: strictly ascending part numbers, known parts, matching ETags

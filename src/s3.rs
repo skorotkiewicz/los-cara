@@ -314,14 +314,6 @@ fn object_headers(meta: &ObjectMeta) -> HeaderMap {
     h
 }
 
-fn resource_path(bucket: &str, key: &str) -> String {
-    if key.is_empty() {
-        format!("/{bucket}")
-    } else {
-        format!("/{bucket}/{key}")
-    }
-}
-
 // ---------------------------------------------------------------- entry / dispatch
 
 async fn entry(State(state): State<AppState>, req: Request) -> Response {

@@ -734,7 +734,7 @@ mod tests {
         headers.insert("host", "127.0.0.1:9000".parse().unwrap());
         headers.insert("x-amz-date", amz_date.parse().unwrap());
         headers.insert("x-amz-content-sha256", payload_hash.parse().unwrap());
-        let signed_headers = ["host", "x-amz-content-sha256", "x-amz-date"];
+        let _signed_headers = ["host", "x-amz-content-sha256", "x-amz-date"];
         let canonical = format!(
             "{method}\n{}\n{}\nhost:127.0.0.1:9000\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n\nhost;x-amz-content-sha256;x-amz-date\n{payload_hash}",
             canonical_uri(path),
