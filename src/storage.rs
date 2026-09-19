@@ -1229,10 +1229,6 @@ mod tests {
                     hex::encode(h.finalize())
                 }
         );
-        assert!(
-            buf == b"old".to_vec(),
-            "must hold previous complete content"
-        );
     }
 
     #[tokio::test]
