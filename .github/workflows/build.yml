@@ -62,8 +62,14 @@ jobs:
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
-          mkdir -p dist
-          tar -czf dist/${{ matrix.artifact }}.tar.gz -C target/${{ matrix.target }}/release lc
+          mkdir -p dist/stage
+          cp target/${{ matrix.target }}/release/lc dist/stage/
+          cp README.md dist/stage/
+          if [[ "${{ matrix.target }}" == *linux* ]]; then
+            mkdir dist/stage/systemd
+            cp packaging/systemd/lc.service packaging/systemd/lc.env.example dist/stage/systemd/
+          fi
+          tar -czf dist/${{ matrix.artifact }}.tar.gz -C dist/stage .
           sha256sum dist/${{ matrix.artifact }}.tar.gz > dist/${{ matrix.artifact }}.tar.gz.sha256
 
       - name: Package (windows)

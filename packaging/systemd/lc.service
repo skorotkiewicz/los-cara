@@ -1,0 +1,54 @@
+# los-cara systemd service (single-node S3-compatible object storage)
+#
+# Install:
+#   sudo cp target/release/lc /usr/local/bin/
+#   sudo mkdir -p /var/lib/lc
+#   sudo chown lc:lc /var/lib/lc
+#   sudo cp packaging/systemd/lc.service /etc/systemd/system/
+#   sudo cp packaging/systemd/lc.env /etc/default/lc   # then edit credentials
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now lc
+#
+# Logs: journalctl -u lc -f
+
+[Unit]
+Description=lc - S3-compatible object storage server
+Documentation=https://github.com/skorotkiewicz/los-cara
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lc
+Group=lc
+EnvironmentFile=/etc/default/lc
+ExecStart=/usr/local/bin/lc serve --address ${LC_ADDRESS} --data ${LC_DATA_DIR} --tls-cert ${LC_TLS_CERT} --tls-key ${LC_TLS_KEY}
+ExecReload=/bin/kill -HUP $MAINPID
+
+# access keys are read from the data dir keys.json; root credentials come
+# from LC_ACCESS_KEY / LC_SECRET_KEY in the environment file
+Restart=on-failure
+RestartSec=2
+
+# hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/var/lib/lc
+
+[Install]
+WantedBy=multi-user.target

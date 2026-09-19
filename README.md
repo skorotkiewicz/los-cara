@@ -55,6 +55,23 @@ lc remove-key --data ./data --access-key app-key
 
 Key changes are picked up by a running server without restart.
 
+### systemd deployment (Linux)
+
+The `packaging/systemd/` directory contains a hardened service unit, an
+environment template, and an installer script:
+
+```bash
+sudo ./packaging/systemd/install.sh [path-to-lc-binary]
+# then: edit /etc/default/lc (credentials/TLS) and
+sudo systemctl enable --now lc
+journalctl -u lc -f
+```
+
+Files: `lc.service` (runs as the `lc` user with systemd sandboxing,
+data in `/var/lib/lc`), `lc.env.example` (environment template installed to
+`/etc/default/lc`), `install.sh` (one-shot installer). Linux release
+tarballs from CI include the systemd files.
+
 ### Browser access with CORS
 
 CORS is disabled by default. Repeat `--cors-allowed-origin` to allow browser
