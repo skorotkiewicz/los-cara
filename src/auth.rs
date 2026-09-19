@@ -112,6 +112,18 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
 }
 
+/// Test/interop helper: derive the SigV4 signing key.
+#[doc(hidden)]
+pub fn signing_key_for_test(secret: &str, date: &str, region: &str) -> Vec<u8> {
+    signing_key(secret, date, region, "s3")
+}
+
+/// Test/interop helper: HMAC-SHA256 as hex.
+#[doc(hidden)]
+pub fn hmac_hex(key: &[u8], data: &[u8]) -> String {
+    hex::encode(hmac_sha256(key, data))
+}
+
 fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
     let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes());
     let k_region = hmac_sha256(&k_date, region.as_bytes());
@@ -272,6 +284,7 @@ pub fn canonical_request_presigned(
             .unwrap_or_default();
         signed_header_lines.push(format!("{name}:{value}"));
     }
+    let _ = &signed_header_lines;
     format!(
         "{method}\n{}\n{}\n{}\n\n{}\n{}",
         canonical_uri(raw_path),

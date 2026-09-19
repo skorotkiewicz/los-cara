@@ -3,7 +3,7 @@
 
 use quick_xml::Reader;
 use quick_xml::escape::escape;
-use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
+use quick_xml::events::Event;
 
 pub const XMLNS_S3: &str = crate::error::XMLNS_S3;
 

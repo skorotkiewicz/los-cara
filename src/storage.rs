@@ -432,7 +432,7 @@ impl Storage {
             Some(l) => l.min(meta.size.saturating_sub(start)),
             None => meta.size.saturating_sub(start),
         };
-        use tokio::io::{AsyncReadExt, AsyncSeekExt, Take};
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
         if start > 0 {
             file.seek(io::SeekFrom::Start(start))
                 .await
@@ -770,7 +770,7 @@ impl Storage {
         src_bucket: &str,
         src_key: &str,
     ) -> Result<(String, u64), S3Error> {
-        let size = self.head_object(src_bucket, src_key).await?.size;
+        let _size = self.head_object(src_bucket, src_key).await?.size;
         let (_, reader) = self.get_object(src_bucket, src_key).await?;
         let stream = tokio_util_wrap::reader_stream(reader);
         self.upload_part(upload_id, part_number, stream).await
@@ -971,7 +971,7 @@ pub mod tokio_util_wrap {
     use futures::Stream;
     use std::pin::Pin;
     use std::task::{Context, Poll};
-    use tokio::io::{AsyncRead, ReadBuf};
+    use tokio::io::AsyncRead;
 
     struct ReaderStream<R> {
         reader: R,

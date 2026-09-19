@@ -104,6 +104,9 @@ async fn auth_and_request_id(
 }
 
 #[derive(Clone)]
+pub struct RequestId(pub String);
+
+#[derive(Clone)]
 pub struct BodyStateHandle(pub Arc<Mutex<BodyStateInner>>);
 
 pub struct BodyStateInner {
@@ -323,11 +326,16 @@ fn resource_path(bucket: &str, key: &str) -> String {
 
 async fn entry(State(state): State<AppState>, req: Request) -> Response {
     let request_id = req
-        .headers()
-        .get("x-amz-request-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string();
+        .extensions()
+        .get::<RequestId>()
+        .map(|r| r.0.clone())
+        .or_else(|| {
+            req.headers()
+                .get("x-amz-request-id")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+        })
+        .unwrap_or_else(|| "unknown".to_string());
     match dispatch(state, req).await {
         Ok(res) => res,
         Err(e) => {
@@ -546,7 +554,10 @@ async fn bucket_get(
             .map(|(_, v)| v.clone())
     };
 
-    // neutral subresource probes
+    // neutral subresource probes (bucket must exist)
+    if !state.storage.bucket_exists(bucket).await? {
+        return Err(S3Error::no_such_bucket(bucket));
+    }
     for neutral in [
         "versioning",
         "acl",
@@ -741,7 +752,7 @@ async fn get_object(
                 range_headers.insert(
                     "content-range",
                     HeaderValue::from_str(&format!(
-                        "bytes {start}-{}-{}",
+                        "bytes {start}-{}/{}",
                         start + len - 1,
                         meta.size
                     ))
@@ -764,9 +775,14 @@ async fn get_object(
     };
 
     let mut h = object_headers(&meta);
+    let content_len = if let Some((start, len)) = &range {
+        len.unwrap_or(meta.size.saturating_sub(*start))
+    } else {
+        meta.size
+    };
     h.insert(
         "content-length",
-        HeaderValue::from_str(&meta.size.to_string()).unwrap(),
+        HeaderValue::from_str(&content_len.to_string()).unwrap(),
     );
     for (k, v) in range_headers {
         if let (Some(k), v) = (k, v) {
@@ -776,18 +792,15 @@ async fn get_object(
     let status = if range.is_some() { 206 } else { 200 };
 
     if head_only {
-        // headers only; hyper suppresses the body for HEAD
+        // headers only; hyper suppresses the body for HEAD while we still
+        // declare the true Content-Length, matching S3 HeadObject semantics
         let _ = reader;
-        let mut h = h;
-        h.remove("content-length"); // hyper sets it from body; for HEAD we set explicit
         let mut builder = Response::builder().status(StatusCode::from_u16(status).unwrap());
         for (k, v) in h {
             if let (Some(k), v) = (k, v) {
                 builder = builder.header(k, v);
             }
         }
-        // preserve declared content length for HEAD
-        let mut builder = builder;
         return Ok(builder.body(Body::empty()).unwrap());
     }
 
@@ -1353,4 +1366,81 @@ async fn list_multipart_uploads(state: &AppState, bucket: &str) -> Result<Respon
     }
     let body = doc.close("ListMultipartUploadsResult").finish();
     Ok(xml_response(200, body, HeaderMap::new()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vhost_bucket_extraction() {
+        assert_eq!(
+            bucket_from_host("bucket.localhost:9000"),
+            Some("bucket".into())
+        );
+        assert_eq!(
+            bucket_from_host("my-bucket.s3.local:80"),
+            Some("my-bucket".into())
+        );
+        assert_eq!(bucket_from_host("127.0.0.1:9000"), None);
+        assert_eq!(bucket_from_host("localhost:9000"), None);
+        assert_eq!(
+            bucket_from_host("examplebucket.s3.amazonaws.com"),
+            Some("examplebucket".into())
+        );
+    }
+
+    #[test]
+    fn query_parsing() {
+        let q = parse_query("list-type=2&prefix=a%2Fb&max-keys=10&flag&x=with%20space");
+        assert_eq!(q[0], ("list-type".to_string(), "2".to_string()));
+        assert_eq!(q[1], ("prefix".to_string(), "a/b".to_string()));
+        assert_eq!(q[2], ("max-keys".to_string(), "10".to_string()));
+        assert_eq!(q[3], ("flag".to_string(), "".to_string()));
+        assert_eq!(q[4], ("x".to_string(), "with space".to_string()));
+    }
+
+    #[test]
+    fn range_parsing_unit() {
+        assert!(matches!(
+            parse_range("bytes=0-99", 1000),
+            RangeParse::Valid(0, 100)
+        ));
+        assert!(matches!(
+            parse_range("bytes=100-", 1000),
+            RangeParse::Valid(100, 900)
+        ));
+        assert!(matches!(
+            parse_range("bytes=-100", 1000),
+            RangeParse::Valid(900, 100)
+        ));
+        assert!(matches!(
+            parse_range("bytes=0-99", 50),
+            RangeParse::Valid(0, 50)
+        )); // end clamped
+        assert!(matches!(
+            parse_range("bytes=1000-2000", 1000),
+            RangeParse::Invalid
+        ));
+        assert!(matches!(
+            parse_range("bytes=abc", 1000),
+            RangeParse::Ignored
+        ));
+        assert!(matches!(parse_range("garbage", 1000), RangeParse::Ignored));
+        assert!(matches!(
+            parse_range("bytes=0-99,200-299", 1000),
+            RangeParse::Ignored
+        ));
+    }
+
+    #[test]
+    fn canonical_query_ordering() {
+        let q = vec![
+            ("b".to_string(), "2".to_string()),
+            ("a".to_string(), "1".to_string()),
+        ];
+        assert_eq!(auth::canonical_query(&q), "a=1&b=2");
+        let q2 = vec![("prefix".to_string(), "a/b".to_string())];
+        assert_eq!(auth::canonical_query(&q2), "prefix=a%2Fb");
+    }
 }

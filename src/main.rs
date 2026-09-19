@@ -1,13 +1,7 @@
-//! los-cara: an S3-compatible object storage server.
-
-pub mod auth;
-pub mod config;
-pub mod error;
-pub mod s3;
-pub mod storage;
-pub mod xml;
+//! los-cara binary: CLI over the library.
 
 use clap::{Parser, Subcommand};
+use los_cara::config;
 use std::path::PathBuf;
 
 #[derive(Parser)]
