@@ -18,6 +18,10 @@ struct TestServer {
 }
 
 async fn spawn_server() -> TestServer {
+    spawn_server_with_cors(&[]).await
+}
+
+async fn spawn_server_with_cors(origins: &[&str]) -> TestServer {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).await.unwrap();
     let creds = CredentialStore::new(
@@ -28,7 +32,13 @@ async fn spawn_server() -> TestServer {
         },
     );
     let state = AppState::new(storage, creds);
-    let app = los_cara::s3::router(state);
+    let app = los_cara::s3::router_with_cors(
+        state,
+        origins
+            .iter()
+            .map(|origin| los_cara::config::parse_cors_origin(origin).unwrap())
+            .collect(),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -61,6 +71,382 @@ where
 {
     e.as_service_error()
         .map(|se| se.meta().code().unwrap_or("").to_string())
+}
+
+#[test]
+fn cors_invalid_origin_rejected_at_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("not-created");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_lc"))
+        .args(["serve", "--address", "not-a-bind-address", "--data"])
+        .arg(&data)
+        .args([
+            "--cors-allowed-origin",
+            "https://app.example",
+            "--cors-allowed-origin",
+            "*",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("invalid CORS origin"), "{stderr}");
+    assert!(!stderr.contains("invalid bind address"), "{stderr}");
+    assert!(!data.exists());
+}
+
+// ---------------- CORS (spec: s3-cors) ----------------
+
+const CORS_ORIGIN: &str = "https://app.example";
+
+fn header_tokens(headers: &reqwest::header::HeaderMap, name: &str) -> Vec<String> {
+    headers
+        .get_all(name)
+        .iter()
+        .flat_map(|value| value.to_str().unwrap().split(','))
+        .map(|value| value.trim().to_ascii_lowercase())
+        .collect()
+}
+
+fn assert_cors(headers: &reqwest::header::HeaderMap, origin: Option<&str>) {
+    assert_eq!(
+        headers
+            .get("access-control-allow-origin")
+            .map(|v| v.to_str().unwrap()),
+        origin
+    );
+    assert!(!headers.contains_key("access-control-allow-credentials"));
+    uuid::Uuid::parse_str(headers["x-amz-request-id"].to_str().unwrap()).unwrap();
+    let vary = header_tokens(headers, "vary");
+    for name in [
+        "origin",
+        "access-control-request-method",
+        "access-control-request-headers",
+    ] {
+        assert!(vary.iter().any(|v| v == name), "missing {name}: {vary:?}");
+    }
+}
+
+#[tokio::test]
+async fn cors_preflight_methods_headers_and_missing_targets() {
+    let server = spawn_server_with_cors(&[CORS_ORIGIN]).await;
+    let c = client(&server);
+    c.create_bucket().bucket("cors").send().await.unwrap();
+    c.put_object()
+        .bucket("cors")
+        .key("exists")
+        .body(ByteStream::from_static(b"kept"))
+        .send()
+        .await
+        .unwrap();
+    let http = reqwest::Client::new();
+    let requested = "Authorization,Content-Type,Content-MD5,Range,If-Match,If-None-Match,If-Modified-Since,If-Unmodified-Since,X-Amz-Date,X-Amz-Content-Sha256,X-Amz-Security-Token,X-Amz-Meta-Owner";
+    let mut first_policy = None;
+    for method in ["GET", "HEAD", "PUT", "POST", "DELETE"] {
+        for path in ["/cors/exists", "/cors/missing", "/missing/key"] {
+            let res = http
+                .request(
+                    reqwest::Method::OPTIONS,
+                    format!("{}{path}", server.endpoint),
+                )
+                .header("origin", CORS_ORIGIN)
+                .header("access-control-request-method", method)
+                .header("access-control-request-headers", requested)
+                .header("x-amz-request-id", "caller-id")
+                .send()
+                .await
+                .unwrap();
+            assert!(res.status().is_success());
+            assert_cors(res.headers(), Some(CORS_ORIGIN));
+            let mut methods = header_tokens(res.headers(), "access-control-allow-methods");
+            methods.sort();
+            assert_eq!(methods, ["delete", "get", "head", "post", "put"]);
+            let allowed = header_tokens(res.headers(), "access-control-allow-headers");
+            for name in requested.to_ascii_lowercase().split(',') {
+                assert!(allowed.iter().any(|v| v == name), "missing {name}");
+            }
+            let policy: Vec<_> = [
+                "access-control-allow-origin",
+                "access-control-allow-methods",
+                "access-control-allow-headers",
+                "vary",
+            ]
+            .into_iter()
+            .map(|name| header_tokens(res.headers(), name))
+            .collect();
+            if let Some(expected) = &first_policy {
+                assert_eq!(&policy, expected);
+            } else {
+                first_policy = Some(policy);
+            }
+            assert!(res.bytes().await.unwrap().is_empty());
+        }
+    }
+    // Even incomplete OPTIONS requests bypass authentication when enabled.
+    let res = http
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/missing", server.endpoint),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    assert_cors(res.headers(), None);
+    assert!(res.bytes().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn cors_denied_disabled_and_no_storage_side_effects() {
+    let http = reqwest::Client::new();
+    for enabled in [true, false] {
+        let server = spawn_server_with_cors(if enabled { &[CORS_ORIGIN] } else { &[] }).await;
+        let c = client(&server);
+        c.create_bucket().bucket("existing").send().await.unwrap();
+        for (origin, method) in [
+            (Some("https://unlisted.example"), "PUT"),
+            (Some("https://app.example.attacker.test"), "PUT"),
+            (Some("https://other.app.example"), "PUT"),
+            (Some("https://sibling.example"), "PUT"),
+            (Some("http://app.example"), "PUT"),
+            (Some("https://app.example:8443"), "PUT"),
+            (Some("null"), "PUT"),
+            (Some("not-an-origin"), "PUT"),
+            (Some("https://app.example/path"), "PUT"),
+            (Some("https://app.example https://other.example"), "PUT"),
+            (None, "PUT"),
+            (Some(CORS_ORIGIN), "PATCH"),
+            (Some(CORS_ORIGIN), "PUT"),
+            (Some(CORS_ORIGIN), "POST"),
+            (Some(CORS_ORIGIN), "DELETE"),
+        ] {
+            for path in ["/missing", "/existing/key", "/existing/key?uploads"] {
+                let mut req = http
+                    .request(
+                        reqwest::Method::OPTIONS,
+                        format!("{}{path}", server.endpoint),
+                    )
+                    .header("access-control-request-method", method)
+                    .header(
+                        "access-control-request-headers",
+                        "authorization,x-amz-meta-test",
+                    );
+                if let Some(origin) = origin {
+                    req = req.header("origin", origin);
+                }
+                let res = req.send().await.unwrap();
+                let headers = res.headers();
+                let grant = headers.get("access-control-allow-origin").is_some()
+                    && header_tokens(headers, "access-control-allow-methods")
+                        .contains(&method.to_ascii_lowercase());
+                assert_eq!(
+                    grant,
+                    enabled && origin == Some(CORS_ORIGIN) && method != "PATCH"
+                );
+                assert!(!headers.contains_key("access-control-allow-credentials"));
+                assert!(headers.contains_key("x-amz-request-id"));
+                if enabled {
+                    assert_cors(headers, origin.filter(|v| *v == CORS_ORIGIN));
+                } else {
+                    assert!(
+                        !headers
+                            .keys()
+                            .any(|name| name.as_str().starts_with("access-control-"))
+                    );
+                    assert_eq!(res.status(), 403); // Original unsigned OPTIONS behavior.
+                }
+            }
+        }
+        let buckets = c.list_buckets().send().await.unwrap();
+        assert_eq!(buckets.buckets().len(), 1);
+        assert_eq!(buckets.buckets()[0].name(), Some("existing"));
+        assert!(
+            c.list_objects_v2()
+                .bucket("existing")
+                .send()
+                .await
+                .unwrap()
+                .contents()
+                .is_empty()
+        );
+        assert!(
+            c.list_multipart_uploads()
+                .bucket("existing")
+                .send()
+                .await
+                .unwrap()
+                .uploads()
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
+async fn cors_presigned_operations_and_errors() {
+    use aws_sdk_s3::presigning::PresigningConfig;
+    let second_origin = "http://localhost:5173";
+    let server =
+        spawn_server_with_cors(&["https://APP.example:443/", second_origin, CORS_ORIGIN]).await;
+    let c = client(&server);
+    let http = reqwest::Client::new();
+    let signing = || PresigningConfig::expires_in(Duration::from_secs(60)).unwrap();
+    c.create_bucket().bucket("cors").send().await.unwrap(); // Signed, no Origin.
+    let put = c
+        .put_object()
+        .bucket("cors")
+        .key("key")
+        .metadata("owner", "browser")
+        .content_type("text/plain")
+        .presigned(signing())
+        .await
+        .unwrap();
+    let mut req = http
+        .put(put.uri())
+        .header("origin", CORS_ORIGIN)
+        .body("browser-data");
+    for (name, value) in put.headers() {
+        req = req.header(name, value);
+    }
+    let res = req.send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert_cors(res.headers(), Some(CORS_ORIGIN));
+    assert_eq!(res.headers()["access-control-expose-headers"], "*");
+    let etag = res.headers()["etag"].to_str().unwrap().to_owned();
+    assert!(res.bytes().await.unwrap().is_empty());
+
+    let get = c
+        .get_object()
+        .bucket("cors")
+        .key("key")
+        .presigned(signing())
+        .await
+        .unwrap();
+    for origin in [
+        Some(CORS_ORIGIN),
+        Some(second_origin),
+        None,
+        Some("https://app.example.attacker.test"),
+        Some("https://other.app.example"),
+        Some("http://app.example"),
+        Some("https://app.example:8443"),
+        Some("null"),
+        Some("bad-origin"),
+    ] {
+        let mut req = http.get(get.uri());
+        if let Some(origin) = origin {
+            req = req.header("origin", origin);
+        }
+        let res = req.send().await.unwrap();
+        assert_eq!(res.status(), 200);
+        assert_cors(
+            res.headers(),
+            origin.filter(|v| [CORS_ORIGIN, second_origin].contains(v)),
+        );
+        assert_eq!(res.headers()["access-control-expose-headers"], "*");
+        assert_eq!(res.headers()["etag"], etag);
+        assert_eq!(res.headers()["x-amz-meta-owner"], "browser");
+        assert_eq!(res.headers()["content-type"], "text/plain");
+        assert_eq!(res.text().await.unwrap(), "browser-data");
+    }
+    for (name, value, status, body) in [
+        ("range", "bytes=0-6", 206, "browser"),
+        ("if-none-match", etag.as_str(), 304, ""),
+    ] {
+        let res = http
+            .get(get.uri())
+            .header("origin", CORS_ORIGIN)
+            .header(name, value)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), status);
+        assert_cors(res.headers(), Some(CORS_ORIGIN));
+        assert_eq!(res.headers()["access-control-expose-headers"], "*");
+        if status == 206 {
+            assert_eq!(res.headers()["content-range"], "bytes 0-6/12");
+        }
+        assert_eq!(res.text().await.unwrap(), body);
+    }
+
+    let bad_signature = client_for(&server.endpoint, ROOT_ACCESS, "wrong-secret")
+        .get_object()
+        .bucket("cors")
+        .key("key")
+        .presigned(signing())
+        .await
+        .unwrap();
+    let missing_bucket = c
+        .get_object()
+        .bucket("missing")
+        .key("key")
+        .presigned(signing())
+        .await
+        .unwrap();
+    let missing_key = c
+        .get_object()
+        .bucket("cors")
+        .key("missing")
+        .presigned(signing())
+        .await
+        .unwrap();
+    for (url, condition, status, code) in [
+        (server.endpoint.as_str(), None, 403, "AccessDenied"),
+        (bad_signature.uri(), None, 403, "SignatureDoesNotMatch"),
+        (missing_bucket.uri(), None, 404, "NoSuchBucket"),
+        (missing_key.uri(), None, 404, "NoSuchKey"),
+        (get.uri(), Some("\"different\""), 412, "PreconditionFailed"),
+    ] {
+        let mut req = http
+            .get(url)
+            .header("origin", CORS_ORIGIN)
+            .header("x-amz-request-id", "caller-id");
+        if let Some(condition) = condition {
+            req = req.header("if-match", condition);
+        }
+        let res = req.send().await.unwrap();
+        assert_eq!(res.status(), status);
+        assert_cors(res.headers(), Some(CORS_ORIGIN));
+        assert_eq!(res.headers()["access-control-expose-headers"], "*");
+        let id = res.headers()["x-amz-request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let body = res.text().await.unwrap();
+        assert!(body.contains(&format!("<Code>{code}</Code>")), "{body}");
+        assert!(
+            body.contains(&format!("<RequestId>{id}</RequestId>")),
+            "{body}"
+        );
+    }
+
+    let unsigned_url = format!("{}/cors/unauthorized", server.endpoint);
+    let res = http
+        .request(reqwest::Method::OPTIONS, &unsigned_url)
+        .header("origin", CORS_ORIGIN)
+        .header("access-control-request-method", "PUT")
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    assert_cors(res.headers(), Some(CORS_ORIGIN));
+    let res = http
+        .put(&unsigned_url)
+        .header("origin", CORS_ORIGIN)
+        .body("not authorized")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 403);
+    assert_cors(res.headers(), Some(CORS_ORIGIN));
+    assert!(
+        res.text()
+            .await
+            .unwrap()
+            .contains("<Code>AccessDenied</Code>")
+    );
+    let objects = c.list_objects_v2().bucket("cors").send().await.unwrap();
+    assert_eq!(objects.contents().len(), 1);
+    assert_eq!(objects.contents()[0].key(), Some("key"));
 }
 
 // ---------------- buckets (spec: s3-buckets) ----------------
@@ -1005,6 +1391,60 @@ async fn unsigned_request_gets_403_xml() {
 }
 
 #[tokio::test]
+async fn request_ids_match_error_xml() {
+    let server = spawn_server().await;
+    let c = client(&server);
+    let http = reqwest::Client::new();
+    let signed = c
+        .get_object()
+        .bucket("missing")
+        .key("key")
+        .presigned(
+            aws_sdk_s3::presigning::PresigningConfig::expires_in(Duration::from_secs(60)).unwrap(),
+        )
+        .await
+        .unwrap();
+    for (url, status, code) in [
+        (server.endpoint.as_str(), 403, "AccessDenied"),
+        (signed.uri(), 404, "NoSuchBucket"),
+    ] {
+        let res = http
+            .get(url)
+            .header("x-amz-request-id", "caller-id")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), status);
+        let id = res.headers()["x-amz-request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        uuid::Uuid::parse_str(&id).unwrap();
+        assert_ne!(id, "caller-id");
+        let body = res.text().await.unwrap();
+        assert!(body.contains(&format!("<RequestId>{id}</RequestId>")));
+        assert!(body.contains(&format!("<Code>{code}</Code>")));
+    }
+    c.create_bucket().bucket("missing").send().await.unwrap();
+    c.put_object()
+        .bucket("missing")
+        .key("key")
+        .body(ByteStream::from_static(b"ok"))
+        .send()
+        .await
+        .unwrap();
+    let res = http
+        .get(signed.uri())
+        .header("x-amz-request-id", "caller-id")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    uuid::Uuid::parse_str(res.headers()["x-amz-request-id"].to_str().unwrap()).unwrap();
+    assert_eq!(res.text().await.unwrap(), "ok");
+}
+
+#[tokio::test]
 async fn presigned_urls_get_and_put() {
     let server = spawn_server().await;
     let c = client(&server);
@@ -1102,8 +1542,17 @@ async fn credential_hot_reload() {
 
 #[tokio::test]
 async fn virtual_hosted_style_requests() {
+    check_virtual_hosted_style(&[]).await;
+}
+
+#[tokio::test]
+async fn cors_virtual_hosted_style_requests() {
+    check_virtual_hosted_style(&[CORS_ORIGIN]).await;
+}
+
+async fn check_virtual_hosted_style(origins: &[&str]) {
     use los_cara::auth as lauth;
-    let server = spawn_server().await;
+    let server = spawn_server_with_cors(origins).await;
     let c = client(&server);
     c.create_bucket().bucket("vhost").send().await.unwrap();
     c.put_object()
@@ -1139,7 +1588,19 @@ async fn virtual_hosted_style_requests() {
         .resolve("vhost.s3.local", addr)
         .build()
         .unwrap();
-    let res = http
+    if let Some(origin) = origins.first() {
+        let res = http
+            .request(reqwest::Method::OPTIONS, format!("http://{host}{path}"))
+            .header("origin", *origin)
+            .header("access-control-request-method", "GET")
+            .send()
+            .await
+            .unwrap();
+        assert!(res.status().is_success());
+        assert_cors(res.headers(), Some(origin));
+        assert!(res.bytes().await.unwrap().is_empty());
+    }
+    let mut req = http
         .get(format!("http://{host}{path}"))
         .header("host", &host)
         .header("x-amz-date", &amz_date)
@@ -1147,10 +1608,14 @@ async fn virtual_hosted_style_requests() {
         .header(
             "authorization",
             format!("AWS4-HMAC-SHA256 Credential={ROOT_ACCESS}/{scope}, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={signature}"),
-        )
-        .send()
-        .await
-        .unwrap();
+        );
+    if let Some(origin) = origins.first() {
+        req = req.header("origin", *origin);
+    }
+    let res = req.send().await.unwrap();
+    if let Some(origin) = origins.first() {
+        assert_cors(res.headers(), Some(origin));
+    }
     let status = res.status();
     let body = res.text().await.unwrap();
     assert_eq!(status, 200, "vhost GET failed: {body}");
@@ -1366,7 +1831,7 @@ async fn upload_part_copy() {
 // ---------------- TLS (task 9.1) ----------------
 
 #[tokio::test]
-async fn serve_over_tls() {
+async fn serve_over_tls_with_cors() {
     let dir = tempfile::tempdir().unwrap();
     let _ = rustls::crypto::ring::default_provider().install_default();
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -1385,7 +1850,10 @@ async fn serve_over_tls() {
             secret_key: ROOT_SECRET.into(),
         },
     );
-    let app = los_cara::s3::router(AppState::new(storage, creds));
+    let app = los_cara::s3::router_with_cors(
+        AppState::new(storage, creds),
+        vec![los_cara::config::parse_cors_origin(CORS_ORIGIN).unwrap()],
+    );
 
     // reserve a port
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1426,6 +1894,45 @@ async fn serve_over_tls() {
         .unwrap();
     let res = http.get(format!("https://{addr}/")).send().await.unwrap();
     assert_eq!(res.status(), 403); // unsigned over TLS -> AccessDenied
+    assert_cors(res.headers(), None);
+    let res = http
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("https://{addr}/missing/key"),
+        )
+        .header("origin", CORS_ORIGIN)
+        .header("access-control-request-method", "PUT")
+        .header(
+            "access-control-request-headers",
+            "Authorization,X-Amz-Meta-Owner",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    assert_cors(res.headers(), Some(CORS_ORIGIN));
+    assert!(header_tokens(res.headers(), "access-control-allow-methods").contains(&"put".into()));
+    assert_eq!(
+        header_tokens(res.headers(), "access-control-allow-headers"),
+        ["authorization", "x-amz-meta-owner"]
+    );
+    assert!(res.bytes().await.unwrap().is_empty());
+    let res = http
+        .get(format!("https://{addr}/missing/key"))
+        .header("origin", CORS_ORIGIN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 403);
+    assert_cors(res.headers(), Some(CORS_ORIGIN));
+    assert_eq!(res.headers()["access-control-expose-headers"], "*");
+    let id = res.headers()["x-amz-request-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let body = res.text().await.unwrap();
+    assert!(body.contains("<Code>AccessDenied</Code>"));
+    assert!(body.contains(&format!("<RequestId>{id}</RequestId>")));
     handle.abort();
     let _ = cert;
 }

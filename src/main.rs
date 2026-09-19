@@ -33,6 +33,9 @@ pub enum Command {
         /// TLS private key PEM file
         #[arg(long)]
         tls_key: Option<PathBuf>,
+        /// Allowed browser origin (repeat for multiple origins; disabled by default)
+        #[arg(long, value_parser = config::parse_cors_origin)]
+        cors_allowed_origin: Vec<axum::http::HeaderValue>,
     },
     /// Add or replace an access key in the data directory key store
     AddKey {
@@ -54,6 +57,41 @@ pub enum Command {
     },
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cors_cli_options() {
+        for origins in [
+            vec![],
+            vec!["https://APP.example:443/"],
+            vec![
+                "https://app.example",
+                "http://localhost:5173",
+                "https://app.example",
+            ],
+        ] {
+            let mut args = vec!["lc", "serve"];
+            for origin in &origins {
+                args.extend(["--cors-allowed-origin", origin]);
+            }
+            let Command::Serve {
+                cors_allowed_origin,
+                ..
+            } = Cli::try_parse_from(args).unwrap().command
+            else {
+                panic!("expected serve");
+            };
+            assert_eq!(cors_allowed_origin.len(), origins.len());
+            for (parsed, input) in cors_allowed_origin.iter().zip(origins) {
+                assert_eq!(*parsed, config::parse_cors_origin(input).unwrap());
+            }
+        }
+        assert!(Cli::try_parse_from(["lc", "serve", "--cors-allowed-origin", "*"]).is_err());
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     tracing_subscriber::fmt()
@@ -71,9 +109,16 @@ fn main() {
             secret_key,
             tls_cert,
             tls_key,
+            cors_allowed_origin,
         } => {
-            rt.block_on(config::serve(
-                &address, &data, access_key, secret_key, tls_cert, tls_key,
+            rt.block_on(config::serve_with_cors(
+                &address,
+                &data,
+                access_key,
+                secret_key,
+                tls_cert,
+                tls_key,
+                cors_allowed_origin,
             ));
         }
         Command::AddKey {

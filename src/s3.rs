@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use tower_http::cors::{AllowHeaders, Any, CorsLayer};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -38,23 +39,55 @@ pub struct AuthContext {
 }
 
 pub fn router(state: AppState) -> axum::Router {
-    axum::Router::new()
+    router_with_cors(state, Vec::new())
+}
+
+/// Build the shared router with origins validated by `config::parse_cors_origin`.
+pub fn router_with_cors(state: AppState, allowed_origins: Vec<HeaderValue>) -> axum::Router {
+    let mut app = axum::Router::new()
         .fallback(entry)
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth_and_request_id,
-        ))
+        .layer(middleware::from_fn_with_state(state.clone(), authenticate));
+    if !allowed_origins.is_empty() {
+        app = app.layer(cors_layer(allowed_origins));
+    }
+    app.layer(middleware::from_fn(request_id_and_log))
         .with_state(state)
+}
+
+fn cors_layer(allowed_origins: Vec<HeaderValue>) -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(allowed_origins)
+        .allow_methods([
+            Method::GET,
+            Method::HEAD,
+            Method::PUT,
+            Method::POST,
+            Method::DELETE,
+        ])
+        .allow_headers(AllowHeaders::mirror_request())
+        .expose_headers(Any)
 }
 
 // ---------------------------------------------------------------- middleware
 
-async fn auth_and_request_id(
-    State(state): State<AppState>,
-    mut req: Request,
-    next: Next,
-) -> Response {
+async fn request_id_and_log(mut req: Request, next: Next) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
+    req.extensions_mut().insert(RequestId(request_id.clone()));
+    let method = req.method().to_string();
+    let raw_path = req.uri().path().to_string();
+    let start = std::time::Instant::now();
+    let mut res = next.run(req).await;
+    let dur = start.elapsed();
+    tracing::info!(%method, path = %raw_path, status = res.status().as_u16(), ?dur, request_id = %request_id, "request");
+    res.headers_mut().insert(
+        "x-amz-request-id",
+        HeaderValue::from_str(&request_id).unwrap(),
+    );
+    res
+}
+
+async fn authenticate(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
+    let request_id = req.extensions().get::<RequestId>().unwrap().0.clone();
     let method = req.method().to_string();
     let raw_path = req.uri().path().to_string();
     let query = parse_query(req.uri().query().unwrap_or(""));
@@ -92,15 +125,7 @@ async fn auth_and_request_id(
     req = req.map(|_| new_body);
     req.extensions_mut().insert(BodyStateHandle(body_state));
 
-    let start = std::time::Instant::now();
-    let mut res = next.run(req).await;
-    let dur = start.elapsed();
-    tracing::info!(%method, path = %raw_path, status = res.status().as_u16(), ?dur, request_id = %request_id, "request");
-    res.headers_mut().insert(
-        "x-amz-request-id",
-        HeaderValue::from_str(&request_id).unwrap(),
-    );
-    res
+    next.run(req).await
 }
 
 #[derive(Clone)]
@@ -317,17 +342,7 @@ fn object_headers(meta: &ObjectMeta) -> HeaderMap {
 // ---------------------------------------------------------------- entry / dispatch
 
 async fn entry(State(state): State<AppState>, req: Request) -> Response {
-    let request_id = req
-        .extensions()
-        .get::<RequestId>()
-        .map(|r| r.0.clone())
-        .or_else(|| {
-            req.headers()
-                .get("x-amz-request-id")
-                .and_then(|v| v.to_str().ok())
-                .map(String::from)
-        })
-        .unwrap_or_else(|| "unknown".to_string());
+    let request_id = req.extensions().get::<RequestId>().unwrap().0.clone();
     match dispatch(state, req).await {
         Ok(res) => res,
         Err(e) => {
@@ -1363,6 +1378,84 @@ async fn list_multipart_uploads(state: &AppState, bucket: &str) -> Result<Respon
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cors_router_policy_and_vary() {
+        use tower::ServiceExt;
+        let origin = HeaderValue::from_static("https://app.example");
+        let app = axum::Router::new()
+            .fallback(|| async { ([("vary", "Accept-Encoding")], "ok") })
+            .layer(cors_layer(vec![origin.clone()]));
+        let res = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let vary = res
+            .headers()
+            .get_all("vary")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect::<Vec<_>>()
+            .join(",")
+            .to_lowercase();
+        for name in [
+            "accept-encoding",
+            "origin",
+            "access-control-request-method",
+            "access-control-request-headers",
+        ] {
+            assert!(vary.split(',').any(|v| v.trim() == name), "{vary}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            Storage::open(dir.path()).await.unwrap(),
+            auth::CredentialStore::new(
+                dir.path(),
+                auth::Credentials {
+                    access_key: "key".into(),
+                    secret_key: "secret".into(),
+                },
+            ),
+        );
+        for enabled in [false, true] {
+            for request_origin in [None, Some(origin.clone())] {
+                let app = router_with_cors(
+                    state.clone(),
+                    if enabled {
+                        vec![origin.clone()]
+                    } else {
+                        vec![]
+                    },
+                );
+                let mut req = Request::builder().uri("/");
+                if let Some(value) = &request_origin {
+                    req = req.header("origin", value);
+                }
+                let res = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+                assert_eq!(res.status(), StatusCode::FORBIDDEN);
+                assert_eq!(
+                    res.headers().get("access-control-allow-origin"),
+                    if enabled {
+                        request_origin.as_ref()
+                    } else {
+                        None
+                    }
+                );
+                assert!(
+                    !res.headers()
+                        .contains_key("access-control-allow-credentials")
+                );
+                if !enabled {
+                    assert!(
+                        !res.headers()
+                            .keys()
+                            .any(|name| name.as_str().starts_with("access-control-"))
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn vhost_bucket_extraction() {
