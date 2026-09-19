@@ -18,14 +18,17 @@
 //! reader either sees the previous complete version or the new complete one.
 
 use crate::error::S3Error;
-use md5::{Digest, Md5};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
+type Md5 = md5::Md5;
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use tokio::io::{AsyncWriteExt, AsyncRead};
+use std::pin::Pin;
+use std::sync::Arc;
 use tokio::fs;
+use tokio::io::{AsyncRead, AsyncWriteExt};
 
 pub const MAX_OBJECT_SIZE: u64 = 5 * 1024 * 1024 * 1024; // 5 GiB per S3 single-PUT limit
 pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024; // 5 MiB
@@ -67,6 +70,7 @@ pub struct MultipartManifest {
     pub parts: BTreeMap<u32, (String, u64)>,
 }
 
+#[derive(Debug)]
 pub struct PutResult {
     pub meta: ObjectMeta,
     /// hex sha256 of the stored content (for x-amz-content-sha256 verification)
@@ -85,15 +89,18 @@ pub struct ListPage {
     pub next_prefix_token: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct Storage {
     root: PathBuf,
+    /// serializes writes per object directory (bucket\0key)
+    locks: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-fn write_json_atomic(path: &Path, value: &impl serde::Serialize) -> io::Result<()> {
+async fn write_json_atomic(path: &Path, value: &impl serde::Serialize) -> io::Result<()> {
     let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
     let data = serde_json::to_vec(value).map_err(io::Error::other)?;
     fs::write(&tmp, data).await?;
@@ -114,7 +121,7 @@ pub fn valid_bucket_name(name: &str) -> bool {
     }
     let bytes = name.as_bytes();
     let valid_char = |c: u8| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'.';
-    if !valid_char(bytes[0]) || !valid_char(bytes[n - 1]) {
+    if !bytes[0].is_ascii_alphanumeric() || !bytes[n - 1].is_ascii_alphanumeric() {
         return false;
     }
     if !bytes.iter().all(|&c| valid_char(c)) {
@@ -125,7 +132,11 @@ pub fn valid_bucket_name(name: &str) -> bool {
         return false;
     }
     // must not be formatted like an IP address
-    if name.split('.').all(|p| p.chars().all(|c| c.is_ascii_digit())) && name.matches('.').count() == 3 {
+    if name
+        .split('.')
+        .all(|p| p.chars().all(|c| c.is_ascii_digit()))
+        && name.matches('.').count() == 3
+    {
         return false;
     }
     true
@@ -147,7 +158,10 @@ impl Storage {
         if !root.join("keys.json").exists() {
             fs::write(root.join("keys.json"), b"{}").await?;
         }
-        Ok(Self { root: root.to_path_buf() })
+        Ok(Self {
+            root: root.to_path_buf(),
+            locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -171,6 +185,14 @@ impl Storage {
         self.root.join("tmp").join(uuid::Uuid::new_v4().to_string())
     }
 
+    async fn object_lock(&self, bucket: &str, key: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let arc = {
+            let mut map = self.locks.lock().unwrap();
+            map.entry(format!("{bucket}\0{key}")).or_default().clone()
+        };
+        Arc::clone(&arc).lock_owned().await
+    }
+
     // ---- buckets ----
 
     pub async fn create_bucket(&self, name: &str) -> Result<bool, S3Error> {
@@ -181,8 +203,13 @@ impl Storage {
         if dir.join("meta.json").exists() {
             return Ok(false);
         }
-        fs::create_dir_all(dir.join("objects")).await.map_err(|e| S3Error::internal(e.to_string()))?;
-        let meta = BucketMeta { name: name.to_string(), created: now_ms() };
+        fs::create_dir_all(dir.join("objects"))
+            .await
+            .map_err(|e| S3Error::internal(e.to_string()))?;
+        let meta = BucketMeta {
+            name: name.to_string(),
+            created: now_ms(),
+        };
         write_json_atomic(&dir.join("meta.json"), &meta)
             .await
             .map_err(|e| S3Error::internal(e.to_string()))?;
@@ -198,8 +225,9 @@ impl Storage {
         if !self.bucket_exists(name).await? {
             return Err(S3Error::no_such_bucket(name));
         }
-        let meta: BucketMeta =
-            read_json(&self.bucket_dir(name).join("meta.json")).await.map_err(|e| S3Error::internal(e.to_string()))?;
+        let meta: BucketMeta = read_json(&self.bucket_dir(name).join("meta.json"))
+            .await
+            .map_err(|e| S3Error::internal(e.to_string()))?;
         Ok(meta.created)
     }
 
@@ -246,6 +274,7 @@ impl Storage {
         })
         .await
         .map_err(|e| S3Error::internal(e.to_string()))?;
+        let _ = found;
         Ok(found)
     }
 
@@ -253,7 +282,14 @@ impl Storage {
 
     /// Stream `body` into the object at `bucket/key`, returning metadata.
     /// Atomic: temp file -> rename -> metadata rename.
-    pub async fn put_object<S>(&self, bucket: &str, key: &str, mut body: S, content_type: String, metadata: BTreeMap<String, String>) -> Result<PutResult, S3Error>
+    pub async fn put_object<S>(
+        &self,
+        bucket: &str,
+        key: &str,
+        mut body: S,
+        content_type: String,
+        metadata: BTreeMap<String, String>,
+    ) -> Result<PutResult, S3Error>
     where
         S: futures::Stream<Item = Result<bytes::Bytes, S3Error>> + Unpin,
     {
@@ -261,38 +297,64 @@ impl Storage {
             return Err(S3Error::no_such_bucket(bucket));
         }
         if key.is_empty() || key.len() > 1024 {
-            return Err(S3Error::invalid_argument("Object key must be between 1 and 1024 bytes"));
+            return Err(S3Error::invalid_argument(
+                "Object key must be between 1 and 1024 bytes",
+            ));
         }
+        let _guard = self.object_lock(bucket, key).await;
 
         let tmp_path = self.tmp_file();
-        let mut file = fs::File::create(&tmp_path).await.map_err(|e| S3Error::internal(e.to_string()))?;
+        let mut file = fs::File::create(&tmp_path)
+            .await
+            .map_err(|e| S3Error::internal(e.to_string()))?;
         let mut md5 = Md5::new();
         let mut sha = Sha256::new();
         let mut size: u64 = 0;
 
+        let mut stream_failed = false;
         while let Some(chunk) = body.next().await {
-            let chunk = chunk?;
-            size += chunk.len() as u64;
-            if size > MAX_OBJECT_SIZE {
-                let _ = fs::remove_file(&tmp_path).await;
-                return Err(S3Error::entity_too_large());
+            match chunk {
+                Ok(chunk) => {
+                    size += chunk.len() as u64;
+                    if size > MAX_OBJECT_SIZE {
+                        let _ = fs::remove_file(&tmp_path).await;
+                        return Err(S3Error::entity_too_large());
+                    }
+                    md5.update(&chunk);
+                    sha.update(&chunk);
+                    if let Err(e) = file.write_all(&chunk).await {
+                        let _ = fs::remove_file(&tmp_path).await;
+                        return Err(S3Error::internal(e.to_string()));
+                    }
+                }
+                Err(e) => {
+                    let _ = fs::remove_file(&tmp_path).await;
+                    stream_failed = true;
+                    return Err(e);
+                }
             }
-            md5.update(&chunk);
-            sha.update(&chunk);
-            file.write_all(&chunk).await.map_err(|e| S3Error::internal(e.to_string()))?;
         }
-        file.flush().await.map_err(|e| S3Error::internal(e.to_string()))?;
-        file.sync_all().await.map_err(|e| S3Error::internal(e.to_string()))?;
+        let _ = stream_failed;
+        file.flush()
+            .await
+            .map_err(|e| S3Error::internal(e.to_string()))?;
+        file.sync_all()
+            .await
+            .map_err(|e| S3Error::internal(e.to_string()))?;
 
         let md5_hex = hex::encode(md5.finalize());
         let sha_hex = hex::encode(sha.finalize());
 
         // install data file under a unique name, then atomically swap metadata
         let dir = self.object_dir(bucket, key);
-        fs::create_dir_all(&dir).await.map_err(|e| S3Error::internal(e.to_string()))?;
+        fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| S3Error::internal(e.to_string()))?;
         let data_name = format!("{}.data", uuid::Uuid::new_v4());
         let data_path = dir.join(&data_name);
-        fs::rename(&tmp_path, &data_path).await.map_err(|e| S3Error::internal(e.to_string()))?;
+        fs::rename(&tmp_path, &data_path)
+            .await
+            .map_err(|e| S3Error::internal(e.to_string()))?;
 
         let meta = ObjectMeta {
             key: key.to_string(),
@@ -308,8 +370,13 @@ impl Storage {
             return Err(S3Error::internal(e.to_string()));
         }
         // remove any orphaned data files from prior versions (best effort)
-        self.gc_object_dir(&dir, &data_name).await;
-        Ok(PutResult { meta, sha256_hex: sha_hex, content_md5_hex: md5_hex })
+        let keep_name = meta.data_file.clone().unwrap_or_default();
+        self.gc_object_dir(&dir, &keep_name).await;
+        Ok(PutResult {
+            meta,
+            sha256_hex: sha_hex,
+            content_md5_hex: md5_hex,
+        })
     }
 
     async fn gc_object_dir(&self, dir: &Path, keep: &str) {
@@ -336,28 +403,42 @@ impl Storage {
     }
 
     /// Open the object content for reading (whole object).
-    pub async fn get_object(&self, bucket: &str, key: &str) -> Result<(ObjectMeta, impl AsyncRead + Unpin), S3Error> {
+    pub async fn get_object(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(ObjectMeta, Pin<Box<dyn AsyncRead + Send>>), S3Error> {
         self.get_object_range(bucket, key, 0, None).await
     }
 
     /// Open the object content for reading, optionally a byte range.
-    pub async fn get_object_range(&self, bucket: &str, key: &str, start: u64, len: Option<u64>) -> Result<(ObjectMeta, impl AsyncRead + Unpin), S3Error> {
+    pub async fn get_object_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        start: u64,
+        len: Option<u64>,
+    ) -> Result<(ObjectMeta, Pin<Box<dyn AsyncRead + Send>>), S3Error> {
         let meta = self.head_object(bucket, key).await?;
         let data_file = meta
             .data_file
             .clone()
             .ok_or_else(|| S3Error::internal("object has no data file"))?;
         let path = self.object_dir(bucket, key).join(data_file);
-        let mut file = fs::File::open(&path).await.map_err(|e| S3Error::internal(e.to_string()))?;
+        let mut file = fs::File::open(&path)
+            .await
+            .map_err(|e| S3Error::internal(e.to_string()))?;
         let read_len = match len {
             Some(l) => l.min(meta.size.saturating_sub(start)),
             None => meta.size.saturating_sub(start),
         };
-        use tokio::io::{AsyncSeekExt, Take};
+        use tokio::io::{AsyncReadExt, AsyncSeekExt, Take};
         if start > 0 {
-            file.seek(io::SeekFrom::Start(start)).await.map_err(|e| S3Error::internal(e.to_string()))?;
+            file.seek(io::SeekFrom::Start(start))
+                .await
+                .map_err(|e| S3Error::internal(e.to_string()))?;
         }
-        let reader: std::pin::Pin<Box<dyn AsyncRead>> = Box::pin(file.take(read_len));
+        let reader: Pin<Box<dyn AsyncRead + Send>> = Box::pin(file.take(read_len));
         Ok((meta, reader))
     }
 
@@ -367,11 +448,15 @@ impl Storage {
         if !self.bucket_exists(bucket).await? {
             return Err(S3Error::no_such_bucket(bucket));
         }
+        let _guard = self.object_lock(bucket, key).await;
         let dir = self.object_dir(bucket, key);
         let meta_path = dir.join("meta.json");
         if meta_path.exists() {
             // capture data file name, then remove metadata before data
-            let data_name = read_json::<ObjectMeta>(&meta_path).await.ok().and_then(|m| m.data_file);
+            let data_name = read_json::<ObjectMeta>(&meta_path)
+                .await
+                .ok()
+                .and_then(|m| m.data_file);
             let _ = fs::remove_file(&meta_path).await;
             if let Some(d) = data_name {
                 let _ = fs::remove_file(dir.join(d)).await;
@@ -394,31 +479,48 @@ impl Storage {
         if !self.bucket_exists(dst_bucket).await? {
             return Err(S3Error::no_such_bucket(dst_bucket));
         }
+        let _guard = self.object_lock(dst_bucket, dst_key).await;
         let dir = self.object_dir(dst_bucket, dst_key);
-        fs::create_dir_all(&dir).await.map_err(|e| S3Error::internal(e.to_string()))?;
+        fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| S3Error::internal(e.to_string()))?;
         let new_data = format!("{}.data", uuid::Uuid::new_v4());
         let src_dir = self.object_dir(src_bucket, src_key);
-        let src_data = src_dir.join(src_meta.data_file.clone().ok_or_else(|| S3Error::internal("missing data file"))?);
+        let src_data = src_dir.join(
+            src_meta
+                .data_file
+                .clone()
+                .ok_or_else(|| S3Error::internal("missing data file"))?,
+        );
         let dst_data = dir.join(&new_data);
         #[cfg(unix)]
         {
             if fs::hard_link(&src_data, &dst_data).await.is_err() {
-                fs::copy(&src_data, &dst_data).await.map_err(|e| S3Error::internal(e.to_string()))?;
+                fs::copy(&src_data, &dst_data)
+                    .await
+                    .map_err(|e| S3Error::internal(e.to_string()))?;
             }
         }
         #[cfg(not(unix))]
         {
-            fs::copy(&src_data, &dst_data).await.map_err(|e| S3Error::internal(e.to_string()))?;
+            fs::copy(&src_data, &dst_data)
+                .await
+                .map_err(|e| S3Error::internal(e.to_string()))?;
         }
         let (etag, content_type, metadata) = match replace {
             Some((ct, md)) => {
                 // content changed semantically -> recompute etag by hashing the file
                 let mut h = Md5::new();
-                let mut file = fs::File::open(&dst_data).await.map_err(|e| S3Error::internal(e.to_string()))?;
+                let mut file = fs::File::open(&dst_data)
+                    .await
+                    .map_err(|e| S3Error::internal(e.to_string()))?;
                 let mut buf = vec![0u8; 65536];
                 use tokio::io::AsyncReadExt;
                 loop {
-                    let n = file.read(&mut buf).await.map_err(|e| S3Error::internal(e.to_string()))?;
+                    let n = file
+                        .read(&mut buf)
+                        .await
+                        .map_err(|e| S3Error::internal(e.to_string()))?;
                     if n == 0 {
                         break;
                     }
@@ -426,7 +528,11 @@ impl Storage {
                 }
                 (hex::encode(h.finalize()), ct, md)
             }
-            None => (src_meta.etag.clone(), src_meta.content_type.clone(), src_meta.metadata.clone()),
+            None => (
+                src_meta.etag.clone(),
+                src_meta.content_type.clone(),
+                src_meta.metadata.clone(),
+            ),
         };
         let meta = ObjectMeta {
             key: dst_key.to_string(),
@@ -441,7 +547,8 @@ impl Storage {
             let _ = fs::remove_file(&dst_data).await;
             return Err(S3Error::internal(e.to_string()));
         }
-        self.gc_object_dir(&dir, meta.data_file.as_deref().unwrap_or("")).await;
+        self.gc_object_dir(&dir, meta.data_file.as_deref().unwrap_or(""))
+            .await;
         Ok(meta)
     }
 
@@ -453,7 +560,7 @@ impl Storage {
             return Err(S3Error::no_such_bucket(bucket));
         }
         let mut out = Vec::new();
-        walk_metas(&self.objects_root(bucket), &mut |path, _| {
+        walk_metas(&self.objects_root(bucket), &mut |_path, _| {
             // meta is read in the walker via blocking read? No: walker collects paths.
         })
         .await
@@ -495,21 +602,23 @@ impl Storage {
             }
             // skip up to and including the start position
             if !start_after.is_empty() {
-                if obj.key <= start_after {
-                    continue;
-                }
-                if !prefix.is_empty() && !obj.key.starts_with(prefix) {
+                if obj.key.as_str() <= start_after {
                     continue;
                 }
             }
             let item_key = if delimiter.is_empty() {
                 None
             } else if let Some(rel) = obj.key[prefix.len()..].find(delimiter) {
-                let cp: String = prefix.to_string() + &obj.key[prefix.len()..prefix.len() + rel + delimiter.len()];
+                let cp: String = prefix.to_string()
+                    + &obj.key[prefix.len()..prefix.len() + rel + delimiter.len()];
                 if prefixes.contains(&cp) {
                     continue;
                 }
-                if !start_after.is_empty() && cp.as_str() <= start_after && start_after.starts_with(prefix) && start_after.ends_with(delimiter) {
+                if !start_after.is_empty()
+                    && cp.as_str() <= start_after
+                    && start_after.starts_with(prefix)
+                    && start_after.ends_with(delimiter)
+                {
                     continue;
                 }
                 Some(cp)
@@ -571,7 +680,9 @@ impl Storage {
             parts: Default::default(),
         };
         let dir = self.multipart_dir(&manifest.upload_id);
-        fs::create_dir_all(dir.join(PART_DIR)).await.map_err(|e| S3Error::internal(e.to_string()))?;
+        fs::create_dir_all(dir.join(PART_DIR))
+            .await
+            .map_err(|e| S3Error::internal(e.to_string()))?;
         write_json_atomic(&dir.join("manifest.json"), &manifest)
             .await
             .map_err(|e| S3Error::internal(e.to_string()))?;
@@ -594,7 +705,12 @@ impl Storage {
     }
 
     /// Upload one part; returns its hex ETag (md5 of part content).
-    pub async fn upload_part<S>(&self, upload_id: &str, part_number: u32, body: S) -> Result<(String, u64), S3Error>
+    pub async fn upload_part<S>(
+        &self,
+        upload_id: &str,
+        part_number: u32,
+        body: S,
+    ) -> Result<(String, u64), S3Error>
     where
         S: futures::Stream<Item = Result<bytes::Bytes, S3Error>> + Unpin,
     {
@@ -602,25 +718,43 @@ impl Storage {
         self.load_manifest(upload_id).await?;
         let part_dir = self.multipart_dir(upload_id).join(PART_DIR);
         let tmp_path = self.tmp_file();
-        let mut file = fs::File::create(&tmp_path).await.map_err(|e| S3Error::internal(e.to_string()))?;
+        let mut file = fs::File::create(&tmp_path)
+            .await
+            .map_err(|e| S3Error::internal(e.to_string()))?;
         let mut h = Md5::new();
         let mut size: u64 = 0;
         let mut body = body;
         while let Some(chunk) = body.next().await {
-            let chunk = chunk?;
-            size += chunk.len() as u64;
-            if size > MAX_OBJECT_SIZE {
-                let _ = fs::remove_file(&tmp_path).await;
-                return Err(S3Error::entity_too_large());
+            match chunk {
+                Ok(chunk) => {
+                    size += chunk.len() as u64;
+                    if size > MAX_OBJECT_SIZE {
+                        let _ = fs::remove_file(&tmp_path).await;
+                        return Err(S3Error::entity_too_large());
+                    }
+                    h.update(&chunk);
+                    if let Err(e) = file.write_all(&chunk).await {
+                        let _ = fs::remove_file(&tmp_path).await;
+                        return Err(S3Error::internal(e.to_string()));
+                    }
+                }
+                Err(e) => {
+                    let _ = fs::remove_file(&tmp_path).await;
+                    return Err(e);
+                }
             }
-            h.update(&chunk);
-            file.write_all(&chunk).await.map_err(|e| S3Error::internal(e.to_string()))?;
         }
-        file.flush().await.map_err(|e| S3Error::internal(e.to_string()))?;
-        file.sync_all().await.map_err(|e| S3Error::internal(e.to_string()))?;
+        file.flush()
+            .await
+            .map_err(|e| S3Error::internal(e.to_string()))?;
+        file.sync_all()
+            .await
+            .map_err(|e| S3Error::internal(e.to_string()))?;
         let etag = hex::encode(h.finalize());
         let dest = part_dir.join(format!("{part_number}.data"));
-        fs::rename(&tmp_path, &dest).await.map_err(|e| S3Error::internal(e.to_string()))?;
+        fs::rename(&tmp_path, &dest)
+            .await
+            .map_err(|e| S3Error::internal(e.to_string()))?;
 
         let mut m = self.load_manifest(upload_id).await?;
         m.parts.insert(part_number, (etag.clone(), size));
@@ -629,19 +763,17 @@ impl Storage {
     }
 
     /// UploadPartCopy: copy a full source object as a part.
-    pub async fn upload_part_copy(&self, upload_id: &str, part_number: u32, src_bucket: &str, src_key: &str) -> Result<(String, u64), S3Error> {
-        let src = self.head_object(src_bucket, src_key).await?;
-        let (reader, size) = {
-            let (meta, r) = self.get_object(src_bucket, src_key).await?;
-            (r, meta.size)
-        };
-        // reuse upload_part streaming machinery via a reader stream
-        use tokio_util_wrap::reader_stream;
-        let stream = reader_stream(reader);
-        self.upload_part(upload_id, part_number, stream).await.map(|(e, _)| (e, size)).map(|(e, s)| {
-            let _ = src;
-            (e, s)
-        })
+    pub async fn upload_part_copy(
+        &self,
+        upload_id: &str,
+        part_number: u32,
+        src_bucket: &str,
+        src_key: &str,
+    ) -> Result<(String, u64), S3Error> {
+        let size = self.head_object(src_bucket, src_key).await?.size;
+        let (_, reader) = self.get_object(src_bucket, src_key).await?;
+        let stream = tokio_util_wrap::reader_stream(reader);
+        self.upload_part(upload_id, part_number, stream).await
     }
 
     pub async fn list_parts(&self, upload_id: &str) -> Result<MultipartManifest, S3Error> {
@@ -649,8 +781,13 @@ impl Storage {
     }
 
     /// Assemble the final object atomically from staged parts.
-    pub async fn complete_multipart(&self, upload_id: &str, listed: &[(u32, String)]) -> Result<ObjectMeta, S3Error> {
+    pub async fn complete_multipart(
+        &self,
+        upload_id: &str,
+        listed: &[(u32, String)],
+    ) -> Result<ObjectMeta, S3Error> {
         let mut m = self.load_manifest(upload_id).await?;
+        let _guard = self.object_lock(&m.bucket, &m.key).await;
 
         // validate: strictly ascending part numbers, known parts, matching ETags
         let mut ordered: Vec<(u32, String)> = listed.to_vec();
@@ -660,7 +797,9 @@ impl Storage {
                 return Err(S3Error::invalid_part_order());
             }
         }
-        if ordered.iter().map(|(n, _)| *n).collect::<Vec<_>>() != listed.iter().map(|(n, _)| *n).collect::<Vec<_>>() {
+        if ordered.iter().map(|(n, _)| *n).collect::<Vec<_>>()
+            != listed.iter().map(|(n, _)| *n).collect::<Vec<_>>()
+        {
             return Err(S3Error::invalid_part_order());
         }
         for (n, etag) in &ordered {
@@ -679,18 +818,30 @@ impl Storage {
 
         // assemble into a tmp file, streaming part by part
         let dir = self.object_dir(&m.bucket, &m.key);
-        fs::create_dir_all(&dir).await.map_err(|e| S3Error::internal(e.to_string()))?;
+        fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| S3Error::internal(e.to_string()))?;
         let data_name = format!("{}.data", uuid::Uuid::new_v4());
         let dst = dir.join(&data_name);
         {
-            let mut out = fs::File::create(&dst).await.map_err(|e| S3Error::internal(e.to_string()))?;
+            let mut out = fs::File::create(&dst)
+                .await
+                .map_err(|e| S3Error::internal(e.to_string()))?;
             for (n, _) in &ordered {
-                let mut part = fs::File::open(self.multipart_dir(upload_id).join(PART_DIR).join(format!("{n}.data")))
+                let mut part = fs::File::open(
+                    self.multipart_dir(upload_id)
+                        .join(PART_DIR)
+                        .join(format!("{n}.data")),
+                )
+                .await
+                .map_err(|e| S3Error::internal(e.to_string()))?;
+                tokio::io::copy(&mut part, &mut out)
                     .await
                     .map_err(|e| S3Error::internal(e.to_string()))?;
-                tokio::io::copy(&mut part, &mut out).await.map_err(|e| S3Error::internal(e.to_string()))?;
             }
-            out.sync_all().await.map_err(|e| S3Error::internal(e.to_string()))?;
+            out.sync_all()
+                .await
+                .map_err(|e| S3Error::internal(e.to_string()))?;
         }
 
         // multipart ETag: md5 of concatenated raw part digests, "-N" suffix
@@ -702,7 +853,10 @@ impl Storage {
         }
         let etag = format!("{}-{}", hex::encode(h.finalize()), ordered.len());
 
-        let total_size: u64 = ordered.iter().map(|(n, _)| m.parts.get(n).map(|(_, s)| *s).unwrap_or(0)).sum();
+        let total_size: u64 = ordered
+            .iter()
+            .map(|(n, _)| m.parts.get(n).map(|(_, s)| *s).unwrap_or(0))
+            .sum();
         let meta = ObjectMeta {
             key: m.key.clone(),
             size: total_size,
@@ -716,7 +870,8 @@ impl Storage {
             let _ = fs::remove_file(&dst).await;
             return Err(S3Error::internal(e.to_string()));
         }
-        self.gc_object_dir(&dir, meta.data_file.as_deref().unwrap_or("")).await;
+        self.gc_object_dir(&dir, meta.data_file.as_deref().unwrap_or(""))
+            .await;
         // staging dir removed only after the object is installed
         let _ = fs::remove_dir_all(self.multipart_dir(upload_id)).await;
         Ok(meta)
@@ -747,7 +902,10 @@ impl Storage {
         Ok(out)
     }
 
-    pub async fn list_multipart_uploads(&self, bucket: &str) -> Result<Vec<MultipartManifest>, S3Error> {
+    pub async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+    ) -> Result<Vec<MultipartManifest>, S3Error> {
         if !self.bucket_exists(bucket).await? {
             return Err(S3Error::no_such_bucket(bucket));
         }
@@ -794,7 +952,9 @@ async fn walk_metas(dir: &Path, f: &mut impl FnMut(&Path, &[u8])) -> io::Result<
 }
 
 fn collect_meta_paths(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in rd.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -805,9 +965,8 @@ fn collect_meta_paths(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Small helper module to convert an AsyncRead into a Stream of Bytes
-/// (used by UploadPartCopy), avoiding an extra top-level dependency surface.
-mod tokio_util_wrap {
+/// Small helper module to convert an AsyncRead into a Stream of Bytes.
+pub mod tokio_util_wrap {
     use bytes::Bytes;
     use futures::Stream;
     use std::pin::Pin;
@@ -838,14 +997,21 @@ mod tokio_util_wrap {
                         Poll::Ready(Some(Ok(Bytes::copy_from_slice(&buf.filled()))))
                     }
                 }
-                Poll::Ready(Err(e)) => Poll::Ready(Some(Err(crate::error::S3Error::internal(e.to_string())))),
+                Poll::Ready(Err(e)) => {
+                    Poll::Ready(Some(Err(crate::error::S3Error::internal(e.to_string()))))
+                }
                 Poll::Pending => Poll::Pending,
             }
         }
     }
 
-    pub fn reader_stream<R: AsyncRead + Unpin>(reader: R) -> impl Stream<Item = Result<Bytes, crate::error::S3Error>> {
-        ReaderStream { reader, buf: Vec::new() }
+    pub fn reader_stream<R: AsyncRead + Unpin>(
+        reader: R,
+    ) -> impl Stream<Item = Result<Bytes, crate::error::S3Error>> {
+        ReaderStream {
+            reader,
+            buf: Vec::new(),
+        }
     }
 }
 
@@ -889,33 +1055,70 @@ mod tests {
     #[tokio::test]
     async fn atomic_put_overwrite() {
         let (st, _dir) = tmp_storage().await;
-        st.create_bucket("b").await.unwrap();
-        st.put_object("b", "k", s(b"v1".as_slice()), "text/plain".into(), Default::default()).await.unwrap();
-        let failed: Vec<Result<bytes::Bytes, S3Error>> = vec![Ok(bytes::Bytes::from_static(b"partial")), Err(S3Error::internal("boom"))];
+        st.create_bucket("test-bucket").await.unwrap();
+        st.put_object(
+            "test-bucket",
+            "k",
+            s(b"v1".as_slice()),
+            "text/plain".into(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let failed: Vec<Result<bytes::Bytes, S3Error>> = vec![
+            Ok(bytes::Bytes::from_static(b"partial")),
+            Err(S3Error::internal("boom")),
+        ];
         let err = st
-            .put_object("b", "k", futures::stream::iter(failed), "text/plain".into(), Default::default())
+            .put_object(
+                "test-bucket",
+                "k",
+                futures::stream::iter(failed),
+                "text/plain".into(),
+                Default::default(),
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code, "InternalError");
         // old object intact, no temp files exposed
-        let (meta, mut r) = st.get_object("b", "k").await.unwrap();
+        let (meta, mut r) = st.get_object("test-bucket", "k").await.unwrap();
         use tokio::io::AsyncReadExt;
         let mut buf = String::new();
         r.read_to_string(&mut buf).await.unwrap();
         assert_eq!(buf, "v1");
-        assert_eq!(meta.etag, hex::encode(md5::compute(b"v1")));
+        assert_eq!(meta.etag, {
+            let mut h = Md5::new();
+            h.update(b"v1");
+            hex::encode(h.finalize())
+        });
         assert!(!st.root().join("tmp").read_dir().unwrap().next().is_some());
     }
 
     #[tokio::test]
     async fn key_sharding_special_chars() {
         let (st, _dir) = tmp_storage().await;
-        st.create_bucket("b").await.unwrap();
-        let long_key = "deep/ключ/日本語/".repeat(50) + "end"; // > 1024 bytes if repeated enough
-        let long_key = long_key.chars().take(1000).collect::<String>();
-        for key in ["a b/c+d", "ключ/файл", "日本/語.txt", long_key.as_str(), "UPPER/lower"] {
-            st.put_object("b", key, s(b"data"), "application/octet-stream".into(), Default::default()).await.unwrap();
-            let m = st.head_object("b", key).await.unwrap();
+        st.create_bucket("test-bucket").await.unwrap();
+        let long_key = "deep/ключ/日本語/".repeat(30); // ~700 bytes, multi-byte chars
+        assert!(long_key.len() < 1024);
+        let exactly_1024 = "k".repeat(1024);
+        for key in [
+            "a b/c+d",
+            "ключ/файл",
+            "日本/語.txt",
+            long_key.as_str(),
+            exactly_1024.as_str(),
+            "UPPER/lower",
+        ] {
+            st.put_object(
+                "test-bucket",
+                key,
+                s(b"data"),
+                "application/octet-stream".into(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+            let m = st.head_object("test-bucket", key).await.unwrap();
             assert_eq!(m.key, key);
         }
     }
@@ -923,39 +1126,69 @@ mod tests {
     #[tokio::test]
     async fn delete_idempotent_no_phantom() {
         let (st, _dir) = tmp_storage().await;
-        st.create_bucket("b").await.unwrap();
-        st.put_object("b", "k", s(b"v"), "t".into(), Default::default()).await.unwrap();
-        st.delete_object("b", "k").await.unwrap();
-        st.delete_object("b", "k").await.unwrap(); // idempotent
-        assert!(st.head_object("b", "k").await.is_err());
-        assert!(st.all_objects("b").await.unwrap().is_empty());
+        st.create_bucket("test-bucket").await.unwrap();
+        st.put_object("test-bucket", "k", s(b"v"), "t".into(), Default::default())
+            .await
+            .unwrap();
+        st.delete_object("test-bucket", "k").await.unwrap();
+        st.delete_object("test-bucket", "k").await.unwrap(); // idempotent
+        assert!(st.head_object("test-bucket", "k").await.is_err());
+        assert!(st.all_objects("test-bucket").await.unwrap().is_empty());
         // directory left empty: no data files
         let mut metas = Vec::new();
-        collect_meta_paths(&st.root().join("buckets/b/objects"), &mut metas);
+        collect_meta_paths(&st.root().join("buckets/test-bucket/objects"), &mut metas);
         assert!(metas.is_empty());
     }
 
     #[tokio::test]
     async fn multipart_staging_invisible() {
         let (st, _dir) = tmp_storage().await;
-        st.create_bucket("b").await.unwrap();
-        let m = st.create_multipart("b", "big", "application/octet-stream".into(), Default::default()).await.unwrap();
-        st.upload_part(&m.upload_id, 1, s(b"part-one-data")).await.unwrap();
+        st.create_bucket("test-bucket").await.unwrap();
+        let m = st
+            .create_multipart(
+                "test-bucket",
+                "big",
+                "application/octet-stream".into(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        st.upload_part(&m.upload_id, 1, s(b"part-one-data"))
+            .await
+            .unwrap();
         // invisible to listing
-        assert!(st.all_objects("b").await.unwrap().is_empty());
+        assert!(st.all_objects("test-bucket").await.unwrap().is_empty());
         // complete
-        let (etag1, _) = st.list_parts(&m.upload_id).await.unwrap().parts.iter().next().map(|(k, v)| (v.0.clone(), *k)).unwrap();
-        let meta = st.complete_multipart(&m.upload_id, &[(1, etag1)]).await.unwrap();
+        let (etag1, _) = st
+            .list_parts(&m.upload_id)
+            .await
+            .unwrap()
+            .parts
+            .iter()
+            .next()
+            .map(|(k, v)| (v.0.clone(), *k))
+            .unwrap();
+        let meta = st
+            .complete_multipart(&m.upload_id, &[(1, etag1)])
+            .await
+            .unwrap();
         assert_eq!(meta.size, 13);
-        assert_eq!(meta.etag, format!("{}-1", {
-            use sha2::Digest as _;
-            let mut h = md5::Md5::new();
-            h.update(hex::decode(hex::encode(md5::compute(b"part-one-data"))).unwrap());
-            hex::encode(h.finalize())
-        }));
+        assert_eq!(
+            meta.etag,
+            format!("{}-1", {
+                let mut h = Md5::new();
+                let mut part_md5 = Md5::new();
+                part_md5.update(b"part-one-data");
+                h.update(part_md5.finalize());
+                hex::encode(h.finalize())
+            })
+        );
         assert!(!st.root().join("multipart").join(&m.upload_id).exists());
         // abort cleanup: create again and abort
-        let m2 = st.create_multipart("b", "big2", "t".into(), Default::default()).await.unwrap();
+        let m2 = st
+            .create_multipart("test-bucket", "big2", "t".into(), Default::default())
+            .await
+            .unwrap();
         st.upload_part(&m2.upload_id, 1, s(b"xyz")).await.unwrap();
         st.abort_multipart(&m2.upload_id).await.unwrap();
         assert!(!st.root().join("multipart").join(&m2.upload_id).exists());
@@ -964,13 +1197,21 @@ mod tests {
     #[tokio::test]
     async fn crash_mid_put_leaves_old_or_complete() {
         let (st, dir) = tmp_storage().await;
-        st.create_bucket("b").await.unwrap();
-        st.put_object("b", "k", s(b"old"), "t".into(), Default::default()).await.unwrap();
+        st.create_bucket("test-bucket").await.unwrap();
+        st.put_object(
+            "test-bucket",
+            "k",
+            s(b"old"),
+            "t".into(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
         // simulate crash: a put future dropped mid-stream
         {
             let big = vec![0u8; 1024];
             let stream = stream::iter(vec![Ok(bytes::Bytes::from(big))]);
-            let put = st.put_object("b", "k", stream, "t".into(), Default::default());
+            let put = st.put_object("test-bucket", "k", stream, "t".into(), Default::default());
             tokio::pin!(put);
             // poll once then drop (simulate kill before completion)
             let _ = futures::poll!(put.as_mut());
@@ -979,61 +1220,116 @@ mod tests {
         // "restart"
         drop(st);
         let st2 = Storage::open(dir.path()).await.unwrap();
-        let (meta, mut r) = st2.get_object("b", "k").await.unwrap();
+        let (meta, mut r) = st2.get_object("test-bucket", "k").await.unwrap();
         use tokio::io::AsyncReadExt;
         let mut buf = Vec::new();
         r.read_to_end(&mut buf).await.unwrap();
-        assert!(buf == b"old".to_vec() || meta.etag == hex::encode(md5::compute(&buf)));
-        assert!(buf == b"old".to_vec(), "must hold previous complete content");
+        assert!(
+            buf == b"old".to_vec()
+                || meta.etag == {
+                    let mut h = Md5::new();
+                    h.update(&buf);
+                    hex::encode(h.finalize())
+                }
+        );
+        assert!(
+            buf == b"old".to_vec(),
+            "must hold previous complete content"
+        );
     }
 
     #[tokio::test]
     async fn concurrent_writes_one_key() {
         let (st, _dir) = tmp_storage().await;
-        st.create_bucket("b").await.unwrap();
-        st.put_object("b", "k", s(b"seed"), "t".into(), Default::default()).await.unwrap();
+        st.create_bucket("test-bucket").await.unwrap();
+        st.put_object(
+            "test-bucket",
+            "k",
+            s(b"seed"),
+            "t".into(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
         let st = std::sync::Arc::new(st);
         let mut handles = Vec::new();
         for i in 0..10u8 {
             let st = st.clone();
             handles.push(tokio::spawn(async move {
                 let content = vec![i; 1000];
-                st.put_object("b", "k", s(content.as_slice()), "t".into(), Default::default()).await.unwrap();
+                st.put_object(
+                    "test-bucket",
+                    "k",
+                    s(content.as_slice()),
+                    "t".into(),
+                    Default::default(),
+                )
+                .await
+                .unwrap();
                 content
             }));
         }
-        let results: Vec<Vec<u8>> = futures::future::join_all(handles).into_iter().map(|h| h.await.unwrap()).collect();
-        let (meta, mut r) = st.get_object("b", "k").await.unwrap();
+        let results: Vec<Vec<u8>> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|h| h.unwrap())
+            .collect();
+        let (meta, mut r) = st.get_object("test-bucket", "k").await.unwrap();
         use tokio::io::AsyncReadExt;
         let mut buf = Vec::new();
         r.read_to_end(&mut buf).await.unwrap();
         assert_eq!(buf.len(), 1000);
-        assert!(results.iter().any(|c| *c == buf), "final must be one complete written version");
-        assert_eq!(meta.etag, hex::encode(md5::compute(&buf)));
+        assert!(
+            results.iter().any(|c| *c == buf),
+            "final must be one complete written version"
+        );
+        assert_eq!(meta.etag, {
+            let mut h = Md5::new();
+            h.update(&buf);
+            hex::encode(h.finalize())
+        });
     }
 
     #[tokio::test]
     async fn restart_persistence() {
         let (st, dir) = tmp_storage().await;
-        st.create_bucket("b").await.unwrap();
-        st.put_object("b", "k1", s(b"one"), "text/plain".into(), Default::default()).await.unwrap();
-        st.put_object("b", "k2", s(b"two"), "t".into(), Default::default()).await.unwrap();
-        let e1 = st.head_object("b", "k1").await.unwrap().etag;
+        st.create_bucket("test-bucket").await.unwrap();
+        st.put_object(
+            "test-bucket",
+            "k1",
+            s(b"one"),
+            "text/plain".into(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        st.put_object(
+            "test-bucket",
+            "k2",
+            s(b"two"),
+            "t".into(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let e1 = st.head_object("test-bucket", "k1").await.unwrap().etag;
         drop(st);
         let st2 = Storage::open(dir.path()).await.unwrap();
-        assert_eq!(st2.head_object("b", "k1").await.unwrap().etag, e1);
-        assert_eq!(st2.all_objects("b").await.unwrap().len(), 2);
+        assert_eq!(st2.head_object("test-bucket", "k1").await.unwrap().etag, e1);
+        assert_eq!(st2.all_objects("test-bucket").await.unwrap().len(), 2);
     }
 
     #[tokio::test]
     async fn max_object_size_enforced() {
         let (st, _dir) = tmp_storage().await;
-        st.create_bucket("b").await.unwrap();
+        st.create_bucket("test-bucket").await.unwrap();
         // simulate a stream that claims to be larger than the max via many chunks is
         // impractical; verify the check triggers with a chunk-bounded counter by
         // temporarily using a big declared chunk: use one chunk > MAX is impossible
         // in memory, so instead verify normal size passes and small limits via part.
-        st.put_object("b", "k", s(b"ok"), "t".into(), Default::default()).await.unwrap();
-        assert_eq!(st.head_object("b", "k").await.unwrap().size, 2);
+        st.put_object("test-bucket", "k", s(b"ok"), "t".into(), Default::default())
+            .await
+            .unwrap();
+        assert_eq!(st.head_object("test-bucket", "k").await.unwrap().size, 2);
     }
 }

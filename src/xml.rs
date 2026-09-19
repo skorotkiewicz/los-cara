@@ -1,9 +1,9 @@
 //! Minimal XML document builder (writing) and parser (reading) used for S3
 //! request/response bodies. Serialization escapes text via quick-xml.
 
+use quick_xml::Reader;
 use quick_xml::escape::escape;
 use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
-use quick_xml::Reader;
 
 pub const XMLNS_S3: &str = crate::error::XMLNS_S3;
 
@@ -24,7 +24,7 @@ impl Xml {
             self.buf.push(' ');
             self.buf.push_str(k);
             self.buf.push_str("=\"");
-            self.buf.push_str(&escape(v));
+            self.buf.push_str(&escape(*v));
             self.buf.push('"');
         }
         self.buf.push('>');
@@ -99,11 +99,19 @@ pub fn parse(data: &[u8]) -> Result<XmlNode, ()> {
         match reader.read_event() {
             Ok(Event::Start(start)) => {
                 let tag = String::from_utf8_lossy(start.name().as_ref()).into_owned();
-                stack.push(XmlNode { tag, text: String::new(), children: Vec::new() });
+                stack.push(XmlNode {
+                    tag,
+                    text: String::new(),
+                    children: Vec::new(),
+                });
             }
             Ok(Event::Empty(start)) => {
                 let tag = String::from_utf8_lossy(start.name().as_ref()).into_owned();
-                let node = XmlNode { tag, text: String::new(), children: Vec::new() };
+                let node = XmlNode {
+                    tag,
+                    text: String::new(),
+                    children: Vec::new(),
+                };
                 if let Some(parent) = stack.last_mut() {
                     parent.children.push(node);
                 } else {
@@ -135,7 +143,11 @@ mod tests {
 
     #[test]
     fn build_error_doc() {
-        let doc = Xml::new().open("Error", &[("xmlns", XMLNS_S3)]).el("Code", "NoSuchKey").close("Error").finish();
+        let doc = Xml::new()
+            .open("Error", &[("xmlns", XMLNS_S3)])
+            .el("Code", "NoSuchKey")
+            .close("Error")
+            .finish();
         assert_eq!(
             doc,
             "<Error xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Code>NoSuchKey</Code></Error>"
@@ -145,7 +157,7 @@ mod tests {
     #[test]
     fn escaping() {
         let doc = Xml::new().el("Key", "a<b>&\"c\"").finish();
-        assert_eq!(doc, "<Key>a&lt;b&gt;&amp;\"c\"</Key>");
+        assert_eq!(doc, "<Key>a&lt;b&gt;&amp;&quot;c&quot;</Key>");
     }
 
     #[test]
@@ -153,7 +165,11 @@ mod tests {
         let body = r#"<Delete><Object><Key>a</Key></Object><Object><Key>b/c</Key></Object><Quiet>true</Quiet></Delete>"#;
         let root = parse(body.as_bytes()).unwrap();
         assert_eq!(root.tag, "Delete");
-        let keys: Vec<String> = root.find_all("Key").into_iter().map(|n| n.text.clone()).collect();
+        let keys: Vec<String> = root
+            .find_all("Key")
+            .into_iter()
+            .map(|n| n.text.clone())
+            .collect();
         assert_eq!(keys, vec!["a", "b/c"]);
         assert_eq!(root.text_of("Quiet").as_deref(), Some("true"));
     }

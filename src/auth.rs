@@ -3,6 +3,7 @@
 //! signature verification. Also hosts the access-key credential store.
 
 use crate::error::S3Error;
+use bytes::Buf;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -18,6 +19,7 @@ pub struct Credentials {
 
 // ---------------- credential store ----------------
 
+#[derive(Clone)]
 pub struct CredentialStore {
     /// path to <data>/keys.json; maps access key -> secret key
     path: PathBuf,
@@ -27,16 +29,22 @@ pub struct CredentialStore {
 #[derive(Default)]
 struct CredCache {
     map: BTreeMap<String, String>,
+    root: Option<(String, String)>,
     mtime: Option<(SystemTime, u64)>,
 }
 
 impl CredentialStore {
     pub fn new(data_dir: &Path, root: Credentials) -> Self {
         let path = data_dir.join("keys.json");
-        let store = Self { path, cached: Default::default() };
+        let store = Self {
+            path,
+            cached: Default::default(),
+        };
         {
             let mut c = store.cached.lock().unwrap();
-            c.map.insert(root.access_key, root.secret_key);
+            let root = (root.access_key, root.secret_key);
+            c.map.insert(root.0.clone(), root.1.clone());
+            c.root = Some(root);
         }
         // allow keys.json to overlay additional keys; root always wins on conflict
         store.reload_if_changed(true);
@@ -45,12 +53,15 @@ impl CredentialStore {
 
     fn reload_if_changed(&self, force: bool) {
         let meta = std::fs::metadata(&self.path).ok();
-        let sig = meta.and_then(|m| {
-            m.modified().ok().map(|t| (t, m.len()))
-        });
+        let sig = meta.and_then(|m| m.modified().ok().map(|t| (t, m.len())));
         let mut c = self.cached.lock().unwrap();
         if force || sig != c.mtime {
             c.mtime = sig;
+            c.map.clear();
+            let root = c.root.clone();
+            if let Some((a, s)) = root {
+                c.map.insert(a, s);
+            }
             if let Ok(data) = std::fs::read(&self.path) {
                 if let Ok(map) = serde_json::from_slice::<BTreeMap<String, String>>(&data) {
                     for (k, v) in map {
@@ -125,7 +136,10 @@ pub fn aws_uri_encode(input: &str, encode_slash: bool) -> String {
 }
 
 pub fn percent_decode(input: &str) -> Option<String> {
-    percent_encoding::percent_decode_str(input).decode_utf8().ok().map(|s| s.into_owned())
+    percent_encoding::percent_decode_str(input)
+        .decode_utf8()
+        .ok()
+        .map(|s| s.into_owned())
 }
 
 /// Canonical query string from parsed query parameters (already decoded).
@@ -135,7 +149,11 @@ pub fn canonical_query(query: &[(String, String)]) -> String {
         .map(|(k, v)| (aws_uri_encode(k, true), aws_uri_encode(v, true)))
         .collect();
     pairs.sort();
-    pairs.iter().map(|(k, v)| format!("{k}={v}")).join("&")
+    pairs
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 /// Canonical URI: decode each path segment, then re-encode with AWS rules,
@@ -165,7 +183,9 @@ pub struct HeaderSig {
 }
 
 pub fn parse_authorization(value: &str) -> Result<HeaderSig, S3Error> {
-    let rest = value.strip_prefix("AWS4-HMAC-SHA256 ").ok_or_else(S3Error::access_denied)?;
+    let rest = value
+        .strip_prefix("AWS4-HMAC-SHA256 ")
+        .ok_or_else(S3Error::access_denied)?;
     let mut credential = None;
     let mut signed_headers = None;
     let mut signature = None;
@@ -192,7 +212,15 @@ pub fn parse_authorization(value: &str) -> Result<HeaderSig, S3Error> {
         return Err(S3Error::access_denied());
     }
     let signed_headers = signed_headers.split(';').map(|s| s.to_string()).collect();
-    Ok(HeaderSig { access_key, date, region, service, signed_headers, signature, amz_date: date.clone() })
+    Ok(HeaderSig {
+        access_key,
+        amz_date: date.clone(),
+        date,
+        region,
+        service,
+        signed_headers,
+        signature,
+    })
 }
 
 /// Build the canonical request for header-based auth.
@@ -205,10 +233,13 @@ pub fn canonical_request_header(
 ) -> Result<String, S3Error> {
     let mut signed_header_lines = Vec::new();
     for name in &sig.signed_headers {
-        let value = headers
+        let raw = headers
             .get(name.as_str())
-            .map(|v| collapse_spaces(v.to_str().map_err(|_| S3Error::signature_does_not_match())?))
             .ok_or_else(S3Error::signature_does_not_match)?;
+        let value = collapse_spaces(
+            raw.to_str()
+                .map_err(|_| S3Error::signature_does_not_match())?,
+        );
         signed_header_lines.push(format!("{name}:{value}"));
     }
     let content_sha = headers
@@ -216,7 +247,7 @@ pub fn canonical_request_header(
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| S3Error::invalid_argument("Missing required header x-amz-content-sha256"))?;
     Ok(format!(
-        "{method}\n{}\n{}\n{}\n{}\n{}",
+        "{method}\n{}\n{}\n{}\n\n{}\n{}",
         canonical_uri(raw_path),
         canonical_query(query),
         signed_header_lines.join("\n"),
@@ -242,7 +273,7 @@ pub fn canonical_request_presigned(
         signed_header_lines.push(format!("{name}:{value}"));
     }
     format!(
-        "{method}\n{}\n{}\n{}\n{}\n{}",
+        "{method}\n{}\n{}\n{}\n\n{}\n{}",
         canonical_uri(raw_path),
         canonical_query(query),
         signed_header_lines.join("\n"),
@@ -252,6 +283,7 @@ pub fn canonical_request_presigned(
 }
 
 /// Outcome of successful verification.
+#[derive(Debug)]
 pub struct Verified {
     pub access_key: String,
     /// scope date, e.g. 20250101
@@ -279,12 +311,13 @@ pub enum PayloadShaMode {
 
 pub fn parse_payload_sha(value: Option<&str>) -> Result<PayloadShaMode, S3Error> {
     match value {
-        None => Err(S3Error::invalid_argument("Missing required header x-amz-content-sha256")),
+        None => Err(S3Error::invalid_argument(
+            "Missing required header x-amz-content-sha256",
+        )),
         Some("UNSIGNED-PAYLOAD") => Ok(PayloadShaMode::Unsigned),
         Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD") => Ok(PayloadShaMode::StreamingSigned),
-        Some("STREAMING-UNSIGNED-PAYLOAD-TRAILER") | Some("STREAMING-AWS4-ECDSA-PAYLOAD-TRAILER") => {
-            Ok(PayloadShaMode::StreamingUnsigned)
-        }
+        Some("STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+        | Some("STREAMING-AWS4-ECDSA-PAYLOAD-TRAILER") => Ok(PayloadShaMode::StreamingUnsigned),
         Some(other) if other.starts_with("STREAMING-") => Ok(PayloadShaMode::StreamingUnsigned),
         Some(hash) => {
             if hash.len() == 64 && hex::decode(hash).is_ok() {
@@ -297,6 +330,7 @@ pub fn parse_payload_sha(value: Option<&str>) -> Result<PayloadShaMode, S3Error>
 }
 
 /// Result of request authentication.
+#[derive(Debug)]
 pub enum AuthResult {
     /// Header-signed request
     Header(Verified),
@@ -329,31 +363,44 @@ fn verify_header(
     query: &[(String, String)],
     headers: &hyper::HeaderMap,
 ) -> Result<Verified, S3Error> {
-    let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or_default();
+    let auth = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
     let sig = parse_authorization(auth)?;
-    let secret = creds.lookup(&sig.access_key).ok_or_else(S3Error::invalid_access_key_id)?;
+    let secret = creds
+        .lookup(&sig.access_key)
+        .ok_or_else(S3Error::invalid_access_key_id)?;
 
     let canonical = canonical_request_header(method, raw_path, query, headers, &sig)?;
     let scope = format!("{}/{}/s3/aws4_request", sig.date, sig.region);
+    let amz_date = headers
+        .get("x-amz-date")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or(&sig.date)
+        .to_string();
     let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{}\n{scope}\n{}",
-        sig.amz_date,
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
         sha256_hex(canonical.as_bytes())
     );
-    // amz-date header must agree with the scope date used for the key
+    // the scope date (from the credential) is used for key derivation
     let key = signing_key(&secret, &sig.date, &sig.region, "s3");
     let expected = hex::encode(hmac_sha256(&key, string_to_sign.as_bytes()));
     if expected != sig.signature.to_lowercase() {
         return Err(S3Error::signature_does_not_match());
     }
-    let mode = parse_payload_sha(headers.get("x-amz-content-sha256").and_then(|v| v.to_str().ok()))?;
+    let mode = parse_payload_sha(
+        headers
+            .get("x-amz-content-sha256")
+            .and_then(|v| v.to_str().ok()),
+    )?;
     Ok(Verified {
         access_key: sig.access_key,
         scope_date: sig.date,
         scope,
         signature: sig.signature,
         payload_sha_mode: mode,
-        amz_date: sig.amz_date,
+        amz_date,
         signing_key: key,
     })
 }
@@ -368,7 +415,12 @@ fn verify_presigned(
     if !matches!(method, "GET" | "PUT" | "HEAD") {
         return Err(S3Error::access_denied());
     }
-    let get = |name: &str| query.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+    let get = |name: &str| {
+        query
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+    };
     let algorithm = get("X-Amz-Algorithm").unwrap_or_default();
     if algorithm != "AWS4-HMAC-SHA256" {
         return Err(S3Error::invalid_argument("Unsupported signing algorithm"));
@@ -390,7 +442,9 @@ fn verify_presigned(
     }
 
     // expiry
-    let expires_secs: i64 = expires.parse().map_err(|_| S3Error::invalid_argument("Invalid X-Amz-Expires"))?;
+    let expires_secs: i64 = expires
+        .parse()
+        .map_err(|_| S3Error::invalid_argument("Invalid X-Amz-Expires"))?;
     let request_time = chrono::NaiveDateTime::parse_from_str(&amz_date, "%Y%m%dT%H%M%SZ")
         .map_err(|_| S3Error::invalid_argument("Invalid X-Amz-Date"))?
         .and_utc();
@@ -400,10 +454,17 @@ fn verify_presigned(
         return Err(S3Error::access_denied());
     }
 
-    let secret = creds.lookup(&access_key).ok_or_else(S3Error::invalid_access_key_id)?;
+    let secret = creds
+        .lookup(&access_key)
+        .ok_or_else(S3Error::invalid_access_key_id)?;
     let signed_headers: Vec<String> = signed_headers_q.split(';').map(|s| s.to_string()).collect();
-    let filtered: Vec<(String, String)> = query.iter().filter(|(k, _)| k != "X-Amz-Signature").cloned().collect();
-    let canonical = canonical_request_presigned(method, raw_path, &filtered, headers, &signed_headers);
+    let filtered: Vec<(String, String)> = query
+        .iter()
+        .filter(|(k, _)| k != "X-Amz-Signature")
+        .cloned()
+        .collect();
+    let canonical =
+        canonical_request_presigned(method, raw_path, &filtered, headers, &signed_headers);
     let scope = format!("{}/{}/s3/aws4_request", date, region);
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{}\n{scope}\n{}",
@@ -462,6 +523,8 @@ pub struct ChunkDecoder {
     finished: bool,
     /// signature of the chunk currently being read
     pending_sig: String,
+    /// accumulated data of the chunk currently being read
+    chunk_data: Vec<u8>,
 }
 
 #[derive(PartialEq)]
@@ -473,7 +536,12 @@ enum DecoderState {
 }
 
 impl ChunkDecoder {
-    pub fn new(signing_key: Vec<u8>, scope: String, amz_date: String, seed_signature: String) -> Self {
+    pub fn new(
+        signing_key: Vec<u8>,
+        scope: String,
+        amz_date: String,
+        seed_signature: String,
+    ) -> Self {
         Self {
             signing_key,
             scope,
@@ -483,6 +551,7 @@ impl ChunkDecoder {
             state: DecoderState::ReadingHeader,
             finished: false,
             pending_sig: String::new(),
+            chunk_data: Vec::new(),
         }
     }
 
@@ -504,7 +573,7 @@ impl ChunkDecoder {
                         None => return Ok(()), // need more data
                         Some(Err(e)) => return Err(e),
                         Some(Ok((size, sig, consumed))) => {
-                            self.pending_sig = sig;
+                            self.pending_sig = sig.clone();
                             self.buf.advance(consumed);
                             if size == 0 {
                                 // final chunk; expect trailing CRLF (and optional trailers)
@@ -525,10 +594,13 @@ impl ChunkDecoder {
                     }
                     let take = remaining.min(self.buf.len());
                     let chunk = self.buf.split_to(take).to_vec();
-                    out.push(bytes::Bytes::from(chunk.clone()));
+                    self.chunk_data.extend_from_slice(&chunk);
+                    out.push(bytes::Bytes::from(chunk));
                     let new_remaining = remaining - take;
                     if new_remaining == 0 {
-                        self.verify_chunk(remaining, &chunk)?;
+                        let full = std::mem::take(&mut self.chunk_data);
+                        self.verify_chunk(remaining, &full)?;
+                        self.prev_signature = self.pending_sig.clone();
                         self.state = DecoderState::ReadingChunkTrailer(0);
                     } else {
                         self.state = DecoderState::ReadingChunk(new_remaining);
@@ -551,7 +623,7 @@ impl ChunkDecoder {
         }
     }
 
-    fn verify_chunk(&self, size: usize, data: &[u8]) -> Result<(), S3Error> {
+    fn verify_chunk(&mut self, size: usize, data: &[u8]) -> Result<(), S3Error> {
         let empty_hash = sha256_hex(b"");
         let chunk_hash = sha256_hex(data);
         let string_to_sign = format!(
@@ -563,6 +635,7 @@ impl ChunkDecoder {
             return Err(S3Error::signature_does_not_match());
         }
         let _ = size;
+        self.prev_signature = self.pending_sig.clone();
         Ok(())
     }
 
@@ -584,10 +657,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
         std::mem::forget(dir);
-        CredentialStore::new(&path, Credentials {
-            access_key: "AKIDEXAMPLE".into(),
-            secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".into(),
-        })
+        CredentialStore::new(
+            &path,
+            Credentials {
+                access_key: "ROOTKEY".into(),
+                secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".into(),
+            },
+        )
     }
 
     #[test]
@@ -603,7 +679,12 @@ mod tests {
         headers.insert("host", "examplebucket.s3.amazonaws.com".parse().unwrap());
         headers.insert("x-amz-date", "20130524T000000Z".parse().unwrap());
         headers.insert("range", "bytes=0-9".parse().unwrap());
-        headers.insert("x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".parse().unwrap());
+        headers.insert(
+            "x-amz-content-sha256",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .parse()
+                .unwrap(),
+        );
 
         let canonical_request = "GET\n/test.txt\n\nhost:examplebucket.s3.amazonaws.com\nrange:bytes=0-9\nx-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\nx-amz-date:20130524T000000Z\n\nhost;range;x-amz-content-sha256;x-amz-date\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
         let scope = "20130524/us-east-1/s3/aws4_request";
@@ -614,7 +695,10 @@ mod tests {
         let key = signing_key(secret, "20130524", "us-east-1", "s3");
         let expected = hex::encode(hmac_sha256(&key, string_to_sign.as_bytes()));
         // This is the signature published in AWS docs for this request.
-        assert_eq!(expected, "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41");
+        assert_eq!(
+            expected,
+            "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
+        );
 
         // sanity: our canonical-uri + query helpers produce the same canonical request
         assert_eq!(super::canonical_uri(canonical_uri), "/test.txt");
@@ -644,7 +728,10 @@ mod tests {
             canonical_query(&query)
         );
         let scope = format!("{date}/us-east-1/s3/aws4_request");
-        let sts = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}", sha256_hex(canonical.as_bytes()));
+        let sts = format!(
+            "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+            sha256_hex(canonical.as_bytes())
+        );
         let key = signing_key(secret, date, "us-east-1", "s3");
         let signature = hex::encode(hmac_sha256(&key, sts.as_bytes()));
         let auth_header = format!(
@@ -653,21 +740,31 @@ mod tests {
         headers.insert("authorization", auth_header.parse().unwrap());
         let result = verify_request(&creds, method, path, &query, &headers);
         match result {
-            Ok(AuthResult::Header(v)) => assert_eq!(v.payload_sha_mode, PayloadShaMode::SignedFull(payload_hash)),
+            Ok(AuthResult::Header(v)) => {
+                assert_eq!(v.payload_sha_mode, PayloadShaMode::SignedFull(payload_hash))
+            }
             other => panic!("expected header auth, got {other:?}"),
         }
 
         // tampered signature
         let mut bad_headers = headers.clone();
-        let bad_sig = format!("AWS4-HMAC-SHA256 Credential=ROOTKEY/{scope}, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=deadbeef");
+        let bad_sig = format!(
+            "AWS4-HMAC-SHA256 Credential=ROOTKEY/{scope}, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=deadbeef"
+        );
         bad_headers.insert("authorization", bad_sig.parse().unwrap());
-        assert!(matches!(verify_request(&creds, method, path, &query, &bad_headers), Err(ref e) if e.code == "SignatureDoesNotMatch"));
+        assert!(
+            matches!(verify_request(&creds, method, path, &query, &bad_headers), Err(ref e) if e.code == "SignatureDoesNotMatch")
+        );
 
         // unknown access key
         let mut unknown = headers.clone();
-        let unknown_cred = format!("AWS4-HMAC-SHA256 Credential=GHOST/{scope}, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={signature}");
+        let unknown_cred = format!(
+            "AWS4-HMAC-SHA256 Credential=GHOST/{scope}, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={signature}"
+        );
         unknown.insert("authorization", unknown_cred.parse().unwrap());
-        assert!(matches!(verify_request(&creds, method, path, &query, &unknown), Err(ref e) if e.code == "InvalidAccessKeyId"));
+        assert!(
+            matches!(verify_request(&creds, method, path, &query, &unknown), Err(ref e) if e.code == "InvalidAccessKeyId")
+        );
     }
 
     #[test]
@@ -675,7 +772,10 @@ mod tests {
         let creds = creds();
         let query: Vec<(String, String)> = vec![
             ("X-Amz-Algorithm".into(), "AWS4-HMAC-SHA256".into()),
-            ("X-Amz-Credential".into(), "ROOTKEY/20200101/us-east-1/s3/aws4_request".into()),
+            (
+                "X-Amz-Credential".into(),
+                "ROOTKEY/20200101/us-east-1/s3/aws4_request".into(),
+            ),
             ("X-Amz-Date".into(), "20200101T000000Z".into()),
             ("X-Amz-Expires".into(), "300".into()),
             ("X-Amz-SignedHeaders".into(), "host".into()),
@@ -690,7 +790,8 @@ mod tests {
     #[test]
     fn presigned_malformed_rejected() {
         let creds = creds();
-        let query: Vec<(String, String)> = vec![("X-Amz-Algorithm".into(), "AWS4-HMAC-SHA256".into())];
+        let query: Vec<(String, String)> =
+            vec![("X-Amz-Algorithm".into(), "AWS4-HMAC-SHA256".into())];
         let mut headers = hyper::HeaderMap::new();
         headers.insert("host", "x".parse().unwrap());
         let err = verify_request(&creds, "GET", "/b/k", &query, &headers).unwrap_err();
@@ -716,7 +817,12 @@ mod tests {
                 sha256_hex(c)
             );
             let sig = hex::encode(hmac_sha256(&key, sts.as_bytes()));
-            write!(raw, "{};chunk-signature={sig}\r\n", hex::encode(c.len())).unwrap();
+            write!(
+                raw,
+                "{};chunk-signature={sig}\r\n",
+                format!("{:x}", c.len())
+            )
+            .unwrap();
             raw.extend_from_slice(c);
             raw.extend_from_slice(b"\r\n");
             prev = sig;
@@ -729,7 +835,12 @@ mod tests {
         let sig = hex::encode(hmac_sha256(&key, sts.as_bytes()));
         write!(raw, "0;chunk-signature={sig}\r\n").unwrap();
 
-        let mut dec = ChunkDecoder::new(key.clone(), scope.clone(), amz_date.to_string(), "seed".to_string());
+        let mut dec = ChunkDecoder::new(
+            key.clone(),
+            scope.clone(),
+            amz_date.to_string(),
+            "seed".to_string(),
+        );
         let mut out = Vec::new();
         // feed in small pieces to exercise buffering
         for piece in raw.chunks(7) {
@@ -753,7 +864,13 @@ mod tests {
     #[test]
     fn credential_store_hot_reload() {
         let dir = tempfile::tempdir().unwrap();
-        let store = CredentialStore::new(dir.path(), Credentials { access_key: "root".into(), secret_key: "s".into() });
+        let store = CredentialStore::new(
+            dir.path(),
+            Credentials {
+                access_key: "root".into(),
+                secret_key: "s".into(),
+            },
+        );
         assert_eq!(store.lookup("root"), Some("s".into()));
         add_key(dir.path(), "extra", "topsecret");
         assert_eq!(store.lookup("extra"), Some("topsecret".into()));

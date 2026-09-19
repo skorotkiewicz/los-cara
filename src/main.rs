@@ -79,12 +79,7 @@ fn main() {
             tls_key,
         } => {
             rt.block_on(config::serve(
-                &address,
-                &data,
-                access_key,
-                secret_key,
-                tls_cert,
-                tls_key,
+                &address, &data, access_key, secret_key, tls_cert, tls_key,
             ));
         }
         Command::AddKey {
@@ -93,11 +88,17 @@ fn main() {
             secret_key,
         } => {
             config::add_key(&data, &access_key, &secret_key);
-            println!("key {access_key} added to {}", data.join("keys.json").display());
+            println!(
+                "key {access_key} added to {}",
+                data.join("keys.json").display()
+            );
         }
         Command::RemoveKey { data, access_key } => {
             config::remove_key(&data, &access_key);
-            println!("key {access_key} removed from {}", data.join("keys.json").display());
+            println!(
+                "key {access_key} removed from {}",
+                data.join("keys.json").display()
+            );
         }
     }
 }
