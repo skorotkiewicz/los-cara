@@ -62,11 +62,11 @@ impl CredentialStore {
             if let Some((a, s)) = root {
                 c.map.insert(a, s);
             }
-            if let Ok(data) = std::fs::read(&self.path) {
-                if let Ok(map) = serde_json::from_slice::<BTreeMap<String, String>>(&data) {
-                    for (k, v) in map {
-                        c.map.insert(k, v);
-                    }
+            if let Ok(data) = std::fs::read(&self.path)
+                && let Ok(map) = serde_json::from_slice::<BTreeMap<String, String>>(&data)
+            {
+                for (k, v) in map {
+                    c.map.insert(k, v);
                 }
             }
         }
@@ -830,12 +830,7 @@ mod tests {
                 sha256_hex(c)
             );
             let sig = hex::encode(hmac_sha256(&key, sts.as_bytes()));
-            write!(
-                raw,
-                "{};chunk-signature={sig}\r\n",
-                format!("{:x}", c.len())
-            )
-            .unwrap();
+            write!(raw, "{:x};chunk-signature={sig}\r\n", c.len()).unwrap();
             raw.extend_from_slice(c);
             raw.extend_from_slice(b"\r\n");
             prev = sig;

@@ -238,10 +238,10 @@ impl Storage {
             .map_err(|e| S3Error::internal(e.to_string()))?;
         while let Ok(Some(entry)) = rd.next_entry().await {
             let meta_path = entry.path().join("meta.json");
-            if meta_path.exists() {
-                if let Ok(meta) = read_json::<BucketMeta>(&meta_path).await {
-                    out.push((meta.name, meta.created));
-                }
+            if meta_path.exists()
+                && let Ok(meta) = read_json::<BucketMeta>(&meta_path).await
+            {
+                out.push((meta.name, meta.created));
             }
         }
         out.sort();
@@ -598,10 +598,8 @@ impl Storage {
                 continue;
             }
             // skip up to and including the start position
-            if !start_after.is_empty() {
-                if obj.key.as_str() <= start_after {
-                    continue;
-                }
+            if !start_after.is_empty() && obj.key.as_str() <= start_after {
+                continue;
             }
             let item_key = if delimiter.is_empty() {
                 None
@@ -888,10 +886,10 @@ impl Storage {
         if let Ok(mut rd) = fs::read_dir(&mp_root).await {
             while let Ok(Some(entry)) = rd.next_entry().await {
                 let path = entry.path().join("manifest.json");
-                if path.exists() {
-                    if let Ok(m) = read_json::<MultipartManifest>(&path).await {
-                        out.push(m);
-                    }
+                if path.exists()
+                    && let Ok(m) = read_json::<MultipartManifest>(&path).await
+                {
+                    out.push(m);
                 }
             }
         }
@@ -918,12 +916,12 @@ impl Storage {
     pub async fn cleanup_tmp(&self, age_secs: i64) {
         if let Ok(mut rd) = fs::read_dir(self.root.join("tmp")).await {
             while let Ok(Some(entry)) = rd.next_entry().await {
-                if let Ok(md) = entry.metadata().await {
-                    if let Ok(modified) = md.modified() {
-                        let age = chrono::DateTime::<chrono::Utc>::from(modified).timestamp();
-                        if chrono::Utc::now().timestamp() - age > age_secs {
-                            let _ = fs::remove_file(entry.path()).await;
-                        }
+                if let Ok(md) = entry.metadata().await
+                    && let Ok(modified) = md.modified()
+                {
+                    let age = chrono::DateTime::<chrono::Utc>::from(modified).timestamp();
+                    if chrono::Utc::now().timestamp() - age > age_secs {
+                        let _ = fs::remove_file(entry.path()).await;
                     }
                 }
             }
@@ -991,7 +989,7 @@ pub mod tokio_util_wrap {
                     if n == 0 {
                         Poll::Ready(None)
                     } else {
-                        Poll::Ready(Some(Ok(Bytes::copy_from_slice(&buf.filled()))))
+                        Poll::Ready(Some(Ok(Bytes::copy_from_slice(buf.filled()))))
                     }
                 }
                 Poll::Ready(Err(e)) => {
@@ -1210,9 +1208,9 @@ mod tests {
             let stream = stream::iter(vec![Ok(bytes::Bytes::from(big))]);
             let put = st.put_object("test-bucket", "k", stream, "t".into(), Default::default());
             tokio::pin!(put);
-            // poll once then drop (simulate kill before completion)
+            // poll once, then let the future drop at end of scope
+            // (simulates a killed server before completion)
             let _ = futures::poll!(put.as_mut());
-            drop(put);
         }
         // "restart"
         drop(st);
@@ -1273,7 +1271,7 @@ mod tests {
         r.read_to_end(&mut buf).await.unwrap();
         assert_eq!(buf.len(), 1000);
         assert!(
-            results.iter().any(|c| *c == buf),
+            results.contains(&buf),
             "final must be one complete written version"
         );
         assert_eq!(meta.etag, {

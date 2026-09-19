@@ -11,6 +11,12 @@ pub struct Xml {
     buf: String,
 }
 
+impl Default for Xml {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Xml {
     pub fn new() -> Self {
         Self { buf: String::new() }
@@ -91,6 +97,7 @@ impl XmlNode {
 }
 
 /// Parse the first document root; returns Err on malformed XML.
+#[allow(clippy::result_unit_err)]
 pub fn parse(data: &[u8]) -> Result<XmlNode, ()> {
     let mut reader = Reader::from_reader(data);
     reader.config_mut().trim_text(true);

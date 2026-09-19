@@ -755,8 +755,7 @@ async fn conditional_requests() {
     assert!(format!("{err:?}").contains("412"));
 
     // If-Modified-Since in the future -> 304
-    let future =
-        aws_sdk_s3::primitives::DateTime::from_secs((chrono::Utc::now().timestamp() + 3600) as i64);
+    let future = aws_sdk_s3::primitives::DateTime::from_secs(chrono::Utc::now().timestamp() + 3600);
     let err = c
         .get_object()
         .bucket("cond")
@@ -841,7 +840,7 @@ async fn batch_delete() {
             .await
             .unwrap();
     }
-    let objs = vec![
+    let objs = [
         aws_sdk_s3::types::ObjectIdentifier::builder()
             .key("b1")
             .build()
@@ -1757,7 +1756,7 @@ async fn concurrent_writes_same_key_atomic() {
         .unwrap();
     let bytes = g.body.collect().await.unwrap().into_bytes().to_vec();
     assert!(
-        candidates.iter().any(|cand| *cand == bytes),
+        candidates.contains(&bytes),
         "final content must be one complete version"
     );
 }

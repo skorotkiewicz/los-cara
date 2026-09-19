@@ -124,6 +124,29 @@ pub async fn serve_with_cors(
     }
 }
 
+fn load_tls(cert: &Path, key: &Path) -> Result<axum_server::tls_rustls::RustlsConfig, String> {
+    let _ = cert;
+    let _ = key;
+    // rustls config built from PEM files
+    let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(
+        std::fs::File::open(cert).map_err(|e| e.to_string())?,
+    ))
+    .collect::<Result<_, _>>()
+    .map_err(|e| e.to_string())?;
+    let key_der = rustls_pemfile::private_key(&mut std::io::BufReader::new(
+        std::fs::File::open(key).map_err(|e| e.to_string())?,
+    ))
+    .map_err(|e| e.to_string())?
+    .ok_or("no private key found")?;
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key_der)
+        .map_err(|e| e.to_string())?;
+    Ok(axum_server::tls_rustls::RustlsConfig::from_config(
+        std::sync::Arc::new(config),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,27 +201,4 @@ mod tests {
             assert!(parse_cors_origin(input).is_err(), "accepted {input:?}");
         }
     }
-}
-
-fn load_tls(cert: &Path, key: &Path) -> Result<axum_server::tls_rustls::RustlsConfig, String> {
-    let _ = cert;
-    let _ = key;
-    // rustls config built from PEM files
-    let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(
-        std::fs::File::open(cert).map_err(|e| e.to_string())?,
-    ))
-    .collect::<Result<_, _>>()
-    .map_err(|e| e.to_string())?;
-    let key_der = rustls_pemfile::private_key(&mut std::io::BufReader::new(
-        std::fs::File::open(key).map_err(|e| e.to_string())?,
-    ))
-    .map_err(|e| e.to_string())?
-    .ok_or("no private key found")?;
-    let config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key_der)
-        .map_err(|e| e.to_string())?;
-    Ok(axum_server::tls_rustls::RustlsConfig::from_config(
-        std::sync::Arc::new(config),
-    ))
 }

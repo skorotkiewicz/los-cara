@@ -277,10 +277,10 @@ fn user_metadata(headers: &HeaderMap) -> BTreeMap<String, String> {
     let mut md = BTreeMap::new();
     for (name, value) in headers {
         let name = name.as_str().to_lowercase();
-        if let Some(rest) = name.strip_prefix("x-amz-meta-") {
-            if let Ok(v) = value.to_str() {
-                md.insert(rest.to_string(), v.to_string());
-            }
+        if let Some(rest) = name.strip_prefix("x-amz-meta-")
+            && let Ok(v) = value.to_str()
+        {
+            md.insert(rest.to_string(), v.to_string());
         }
     }
     md
@@ -305,10 +305,11 @@ pub fn bucket_from_host(host: &str) -> Option<String> {
         ".localdomain",
         ".s3.amazonaws.com",
     ] {
-        if let Some(bucket) = host.strip_suffix(suffix) {
-            if !bucket.is_empty() && !bucket.contains('/') {
-                return Some(bucket.to_string());
-            }
+        if let Some(bucket) = host.strip_suffix(suffix)
+            && !bucket.is_empty()
+            && !bucket.contains('/')
+        {
+            return Some(bucket.to_string());
         }
     }
     None
@@ -376,11 +377,7 @@ async fn dispatch(state: AppState, req: Request) -> Result<Response, S3Error> {
     // virtual-hosted-style: bucket from Host header
     let vhost_bucket = header_opt(&headers, "host").and_then(|h| bucket_from_host(&h));
     let raw_path = req.uri().path();
-    let segments = decode_path(if vhost_bucket.is_some() {
-        raw_path
-    } else {
-        raw_path
-    })?;
+    let segments = decode_path(raw_path)?;
     let (bucket, key): (String, String) = match (&vhost_bucket, segments.is_empty()) {
         (Some(b), false) => (b.clone(), segments.join("/")),
         (Some(b), true) => (b.clone(), String::new()),
@@ -476,10 +473,10 @@ fn check_body_state(
             return Err(S3Error::sha_mismatch());
         }
     }
-    if let (Some(expected), Some(put)) = (&st.content_md5_hex, put_result) {
-        if expected != &put.content_md5_hex {
-            return Err(S3Error::bad_digest());
-        }
+    if let (Some(expected), Some(put)) = (&st.content_md5_hex, put_result)
+        && expected != &put.content_md5_hex
+    {
+        return Err(S3Error::bad_digest());
     }
     Ok(())
 }
@@ -598,15 +595,12 @@ async fn bucket_get(
     if has("uploads") {
         return list_multipart_uploads(state, bucket).await;
     }
+    let _ = headers;
     let list_type = get_q("list-type");
     match list_type.as_deref() {
         Some("2") => list_objects_v2(state, bucket, query).await,
         _ => list_objects_v1(state, bucket, query).await,
     }
-    .map(|res| {
-        let _ = headers;
-        res
-    })
 }
 
 async fn neutral_bucket_response(sub: &str, state: &AppState, bucket: &str) -> Response {
@@ -846,20 +840,20 @@ fn evaluate_conditions(
         if !match_list(im) {
             return Err(S3Error::precondition_failed());
         }
-    } else if let Some(ius) = if_unmodified_since {
-        if last_modified > ius {
-            return Err(S3Error::precondition_failed());
-        }
+    } else if let Some(ius) = if_unmodified_since
+        && last_modified > ius
+    {
+        return Err(S3Error::precondition_failed());
     }
 
     if let Some(inm) = &if_none_match {
         if match_list(inm) {
             return Ok(Some(xml_response(304, String::new(), HeaderMap::new())));
         }
-    } else if let Some(ims) = if_modified_since {
-        if last_modified <= ims {
-            return Ok(Some(xml_response(304, String::new(), HeaderMap::new())));
-        }
+    } else if let Some(ims) = if_modified_since
+        && last_modified <= ims
+    {
+        return Ok(Some(xml_response(304, String::new(), HeaderMap::new())));
     }
     let _ = etag;
     Ok(None)

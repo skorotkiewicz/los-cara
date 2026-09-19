@@ -57,41 +57,6 @@ pub enum Command {
     },
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cors_cli_options() {
-        for origins in [
-            vec![],
-            vec!["https://APP.example:443/"],
-            vec![
-                "https://app.example",
-                "http://localhost:5173",
-                "https://app.example",
-            ],
-        ] {
-            let mut args = vec!["lc", "serve"];
-            for origin in &origins {
-                args.extend(["--cors-allowed-origin", origin]);
-            }
-            let Command::Serve {
-                cors_allowed_origin,
-                ..
-            } = Cli::try_parse_from(args).unwrap().command
-            else {
-                panic!("expected serve");
-            };
-            assert_eq!(cors_allowed_origin.len(), origins.len());
-            for (parsed, input) in cors_allowed_origin.iter().zip(origins) {
-                assert_eq!(*parsed, config::parse_cors_origin(input).unwrap());
-            }
-        }
-        assert!(Cli::try_parse_from(["lc", "serve", "--cors-allowed-origin", "*"]).is_err());
-    }
-}
-
 fn main() {
     let cli = Cli::parse();
     tracing_subscriber::fmt()
@@ -139,5 +104,40 @@ fn main() {
                 data.join("keys.json").display()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cors_cli_options() {
+        for origins in [
+            vec![],
+            vec!["https://APP.example:443/"],
+            vec![
+                "https://app.example",
+                "http://localhost:5173",
+                "https://app.example",
+            ],
+        ] {
+            let mut args = vec!["lc", "serve"];
+            for origin in &origins {
+                args.extend(["--cors-allowed-origin", origin]);
+            }
+            let Command::Serve {
+                cors_allowed_origin,
+                ..
+            } = Cli::try_parse_from(args).unwrap().command
+            else {
+                panic!("expected serve");
+            };
+            assert_eq!(cors_allowed_origin.len(), origins.len());
+            for (parsed, input) in cors_allowed_origin.iter().zip(origins) {
+                assert_eq!(*parsed, config::parse_cors_origin(input).unwrap());
+            }
+        }
+        assert!(Cli::try_parse_from(["lc", "serve", "--cors-allowed-origin", "*"]).is_err());
     }
 }
