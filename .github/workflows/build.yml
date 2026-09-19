@@ -1,0 +1,103 @@
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.artifact }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # linux
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            artifact: lc-linux-amd64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: lc-linux-arm64
+          # macos
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: lc-macos-amd64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact: lc-macos-arm64
+          # windows
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: lc-windows-amd64
+          # windows arm64 has no hosted runner: cross-compile with cargo-xwin
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            artifact: lc-windows-arm64
+            xwin: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build (native)
+        if: ${{ !matrix.xwin }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Install cargo-xwin
+        if: matrix.xwin
+        run: cargo install cargo-xwin --locked
+
+      - name: Build (windows arm64 cross)
+        if: matrix.xwin
+        run: cargo xwin build --release --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          tar -czf dist/${{ matrix.artifact }}.tar.gz -C target/${{ matrix.target }}/release lc
+          sha256sum dist/${{ matrix.artifact }}.tar.gz > dist/${{ matrix.artifact }}.tar.gz.sha256
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path target/${{ matrix.target }}/release/lc.exe -DestinationPath dist/${{ matrix.artifact }}.zip
+          $h = (Get-FileHash dist/${{ matrix.artifact }}.zip -Algorithm SHA256).Hash.ToLower()
+          "$h  ${{ matrix.artifact }}.zip" | Out-File -Encoding ascii dist/${{ matrix.artifact }}.zip.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
