@@ -11,34 +11,32 @@ env:
 jobs:
   build:
     name: ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # linux
-          - os: ubuntu-24.04
+          # linux amd64: native
+          - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: lc-linux-amd64
-          - os: ubuntu-24.04-arm
+          # linux arm64: cross-compile from ubuntu
+          - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             artifact: lc-linux-arm64
-          # macos
-          - os: macos-13
+            cross: aarch64-linux-gnu-gcc
+          # macos amd64: cross-compile from macos arm runner
+          - os: macos-latest
             target: x86_64-apple-darwin
             artifact: lc-macos-amd64
-          - os: macos-14
+          # macos arm64: native
+          - os: macos-latest
             target: aarch64-apple-darwin
             artifact: lc-macos-arm64
-          # windows
+          # windows amd64: native
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: lc-windows-amd64
-          # windows arm64 has no hosted runner: cross-compile with cargo-xwin
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
-            artifact: lc-windows-arm64
-            xwin: true
-    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -50,17 +48,16 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Build (native)
-        if: ${{ !matrix.xwin }}
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Install cross-linker (linux arm64)
+        if: matrix.cross
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      - name: Install cargo-xwin
-        if: matrix.xwin
-        run: cargo install cargo-xwin --locked
-
-      - name: Build (windows arm64 cross)
-        if: matrix.xwin
-        run: cargo xwin build --release --target ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_CC: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_AR: aarch64-linux-gnu-ar
 
       - name: Package (unix)
         if: runner.os != 'Windows'
