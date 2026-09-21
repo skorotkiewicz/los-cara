@@ -21,10 +21,10 @@ pub enum Command {
         /// Data directory
         #[arg(long, default_value = "./data")]
         data: PathBuf,
-        /// Root access key (or set LOS_CARA_ACCESS_KEY)
+        /// Root access key (or set LC_ACCESS_KEY env)
         #[arg(long)]
         access_key: Option<String>,
-        /// Root secret key (or set LOS_CARA_SECRET_KEY)
+        /// Root secret key (or set LC_SECRET_KEY env)
         #[arg(long)]
         secret_key: Option<String>,
         /// TLS certificate PEM file (enables HTTPS)

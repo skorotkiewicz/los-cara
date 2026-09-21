@@ -77,8 +77,12 @@ pub async fn serve_with_cors(
             std::process::exit(1);
         }
     };
-    let access_key = access_key.or_else(|| std::env::var("LOS_CARA_ACCESS_KEY").ok());
-    let secret_key = secret_key.or_else(|| std::env::var("LOS_CARA_SECRET_KEY").ok());
+    let access_key = access_key
+        .or_else(|| std::env::var("LC_ACCESS_KEY").ok())
+        .or_else(|| std::env::var("LOS_CARA_ACCESS_KEY").ok());
+    let secret_key = secret_key
+        .or_else(|| std::env::var("LC_SECRET_KEY").ok())
+        .or_else(|| std::env::var("LOS_CARA_SECRET_KEY").ok());
     let creds = match (access_key, secret_key) {
         (Some(a), Some(s)) if !a.is_empty() && !s.is_empty() => Credentials {
             access_key: a,
@@ -200,5 +204,18 @@ mod tests {
         ] {
             assert!(parse_cors_origin(input).is_err(), "accepted {input:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod env_tests {
+    /// The env-var precedence test runs in a subprocess-free way: we can't
+    /// safely mutate process env in parallel tests, so just document the
+    /// contract here and verify the vars the systemd template uses.
+    #[test]
+    fn env_names_match_systemd_template() {
+        let template = include_str!("../../packaging/systemd/lc.env.example");
+        assert!(template.contains("LC_ACCESS_KEY="));
+        assert!(template.contains("LC_SECRET_KEY="));
     }
 }
