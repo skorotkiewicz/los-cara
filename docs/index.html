@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="los-cara: an S3-compatible object storage server written in Rust. One binary, your disks, no external database.">
+  <meta name="theme-color" content="#f5f1e7">
+  <title>los-cara | A small storage operation.</title>
+  <style>
+    :root { color-scheme: light; --paper: #f5f1e7; --ink: #23251f; --muted: #595c50; --orange: #bd3a17; --line: #c6c6b6; }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body { margin: 0; background: var(--paper); color: var(--ink); font-family: system-ui, sans-serif; line-height: 1.6; }
+    a { color: inherit; text-underline-offset: .22em; }
+    a:hover { color: var(--orange); }
+    a:focus-visible { outline: 3px solid var(--orange); outline-offset: 5px; }
+    .wrap { width: min(1100px, 100% - 48px); margin-inline: auto; }
+    .skip { position: absolute; top: -100px; background: var(--paper); padding: 12px; z-index: 2; }
+    .skip:focus { top: 12px; }
+    header { display: flex; justify-content: space-between; align-items: center; padding-block: 24px; border-bottom: 1px solid var(--ink); gap: 20px; }
+    .logo { font-size: 1.4rem; font-weight: 900; text-decoration: none; letter-spacing: -.06em; }
+    .logo span { color: var(--orange); }
+    nav { display: flex; gap: 24px; font-size: .9rem; }
+    .hero { display: grid; grid-template-columns: 1.4fr 1fr; align-items: center; gap: 32px; padding-block: 80px 64px; }
+    .eyebrow, .label { font: .75rem ui-monospace, monospace; text-transform: uppercase; letter-spacing: .12em; }
+    .eyebrow { color: var(--orange); font-weight: bold; }
+    h1 { font-size: clamp(3.4rem, 7vw, 6rem); line-height: 1.02; letter-spacing: -.065em; margin: 24px 0; }
+    h1 em { color: var(--orange); font-style: normal; }
+    .intro { font-size: 1.15rem; max-width: 460px; color: var(--muted); }
+    .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 24px; margin-top: 32px; }
+    .button { display: inline-block; background: var(--ink); color: var(--paper); padding: 12px 22px; text-decoration: none; font-weight: 650; border: 2px solid var(--ink); }
+    .button:hover { background: var(--orange); border-color: var(--orange); color: white; }
+    .crate { margin: 0; text-align: center; }
+    .crate svg { display: block; width: 100%; max-width: 350px; margin: auto; }
+    .crate figcaption { color: var(--muted); font: .8rem ui-monospace, monospace; margin-top: 16px; }
+    .strip { border-block: 1px solid var(--ink); padding-block: 16px; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px 24px; font: .8rem ui-monospace, monospace; }
+    section { scroll-margin-top: 24px; }
+    .features { display: grid; grid-template-columns: repeat(3, 1fr); gap: 36px; padding-block: 56px; }
+    .number { color: var(--orange); font: .8rem ui-monospace, monospace; }
+    h2 { font-size: clamp(1.8rem, 4vw, 2.7rem); line-height: 1.15; letter-spacing: -.045em; margin: 16px 0; }
+    h3 { font-size: 1.15rem; margin: 12px 0; letter-spacing: -.025em; }
+    .features p { color: var(--muted); margin: 0; }
+    .setup { display: grid; grid-template-columns: .85fr 1.15fr; gap: 48px; padding-block: 48px; border-top: 1px solid var(--line); align-items: start; }
+    .setup p { color: var(--muted); }
+    .terminal { min-width: 0; background: var(--ink); color: #f5f1e7; border: 1px solid var(--ink); }
+    .terminal-title { padding: 12px 20px; border-bottom: 1px solid #54564c; color: #c6c6b6; font: .75rem ui-monospace, monospace; }
+    pre { overflow-x: auto; margin: 0; padding: 24px; font-size: .83rem; line-height: 1.9; }
+    code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    pre:focus-visible { outline: 3px solid var(--orange); outline-offset: 3px; }
+    .comment { color: #b5b9a6; }
+    .command { color: #fca579; }
+    .fine-print { display: grid; grid-template-columns: 1fr 1fr; gap: 48px; padding: 32px 0 48px; }
+    .fine-print article { border-top: 1px solid var(--line); padding-top: 16px; }
+    .fine-print p { color: var(--muted); font-size: .95rem; }
+    footer { border-top: 1px solid var(--ink); display: flex; justify-content: space-between; flex-wrap: wrap; gap: 16px; padding-block: 24px 40px; font-size: .8rem; color: var(--muted); }
+    @media (max-width: 700px) {
+      .hero { grid-template-columns: 1fr; padding-block: 48px; }
+      .crate svg { max-width: 230px; }
+      .features, .setup, .fine-print { grid-template-columns: 1fr; gap: 28px; }
+      .wrap { width: calc(100% - 32px); }
+      nav { gap: 16px; }
+      .strip { justify-content: flex-start; }
+    }
+    @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+  </style>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <div class="wrap">
+    <header>
+      <a class="logo" href="#" aria-label="los-cara home">los-cara<span>.</span></a>
+      <nav aria-label="Main navigation">
+        <a href="#setup">Get started</a>
+        <a href="https://github.com/skorotkiewicz/los-cara">GitHub ↗</a>
+      </nav>
+    </header>
+    <main id="main">
+      <section class="hero" aria-labelledby="headline">
+        <div>
+          <p class="eyebrow">Rust-built. Home-server approved.</p>
+          <h1 id="headline">A small storage<br><em>operation.</em></h1>
+          <p class="intro">S3-compatible object storage for your own server. One binary. Your disks. A suspicious number of buckets.</p>
+          <div class="actions">
+            <a class="button" href="#setup">Start the operation ↗</a>
+            <a href="https://github.com/skorotkiewicz/los-cara/releases">Get a release</a>
+          </div>
+        </div>
+        <figure class="crate">
+          <svg viewBox="0 0 360 330" role="img" aria-labelledby="bucket-title">
+            <title id="bucket-title">An orange storage bucket wearing sunglasses</title>
+            <ellipse cx="180" cy="304" rx="115" ry="12" fill="#dedecf"/>
+            <path d="M105 99V79a75 75 0 0 1 150 0v20" fill="none" stroke="#23251f" stroke-width="12"/>
+            <path d="M61 105h238l-28 175q-91 32-182 0Z" fill="#d95127" stroke="#23251f" stroke-width="5" stroke-linejoin="round"/>
+            <ellipse cx="180" cy="105" rx="119" ry="25" fill="#ef8758" stroke="#23251f" stroke-width="5"/>
+            <path d="M85 152h73l-5 38q-32 13-62-4Zm117 0h73l-6 34q-30 17-62 4Z" fill="#23251f"/>
+            <path d="M157 160q23-12 47 0M82 151l-12-7m204 7 15-7" fill="none" stroke="#23251f" stroke-width="7"/>
+            <path d="m118 159 18 0m84 0h18" stroke="#f5f1e7" stroke-width="5" stroke-linecap="round"/>
+            <path d="M163 213q18 13 36-1" fill="none" stroke="#23251f" stroke-width="5" stroke-linecap="round"/>
+            <rect x="135" y="243" width="90" height="35" rx="2" fill="#f5f1e7" transform="rotate(-5 180 260)"/>
+            <text x="180" y="267" text-anchor="middle" fill="#23251f" font-family="monospace" font-size="22" font-weight="bold" transform="rotate(-5 180 260)">lc</text>
+          </svg>
+          <figcaption>Head of bucket operations.</figcaption>
+        </figure>
+      </section>
+      <div class="strip" aria-label="Project highlights">
+        <span>01 / S3-compatible API</span>
+        <span>02 / Single binary</span>
+        <span>03 / No external database</span>
+        <span>04 / Bring your own disk</span>
+      </div>
+      <section class="features" aria-label="Why los-cara">
+        <article>
+          <span class="number">[ THE FRONT ]</span>
+          <h3>Your apps know the handshake.</h3>
+          <p>Use AWS CLI, rclone, or an S3 SDK. Set the endpoint and credentials. Your app doesn't need the origin story.</p>
+        </article>
+        <article>
+          <span class="number">[ THE WAREHOUSE ]</span>
+          <h3>Files. On a disk. Revolutionary.</h3>
+          <p>Objects and metadata live in your data directory. No external database to recruit into the operation.</p>
+        </article>
+        <article>
+          <span class="number">[ THE BOUNCER ]</span>
+          <h3>No signature, no shipment.</h3>
+          <p>SigV4 authentication, presigned URLs, and optional TLS. Sunglasses alone do not count as credentials.</p>
+        </article>
+      </section>
+      <section class="setup" id="setup" aria-labelledby="setup-title">
+        <div>
+          <span class="label">Set up shop</span>
+          <h2>Less ceremony.<br>More storage.</h2>
+          <p>From the repository, build and start <code>lc</code>. Then point your S3 client at <code>http://127.0.0.1:9000</code> with the same credentials.</p>
+          <p>This example stays on localhost. Use real secrets and configure TLS before exposing it to a network.</p>
+          <a href="https://github.com/skorotkiewicz/los-cara#quickstart">Full setup &amp; client examples ↗</a>
+        </div>
+        <div class="terminal">
+          <div class="terminal-title">terminal / opening the warehouse</div>
+          <pre tabindex="0" aria-label="Build and start commands"><code><span class="comment"># From the repo. No initiation ritual.</span>
+<span class="command">cargo</span> build --release
+
+<span class="comment"># Local demo credentials. Replace these.</span>
+<span class="command">./target/release/lc</span> serve \
+  --address 127.0.0.1:9000 \
+  --data ./data \
+  --access-key local-demo \
+  --secret-key replace-this-secret</code></pre>
+        </div>
+      </section>
+      <section class="fine-print" aria-label="Scope and origin story">
+        <article>
+          <span class="label">The honest bit</span>
+          <h3>A storage server. Not the whole cloud.</h3>
+          <p>Buckets, objects, listings, multipart uploads, range requests, and copy operations are on the menu. Versioning, replication, lifecycle policies, and IAM are not implemented. Keep backups. Even the boss keeps backups.</p>
+          <a href="https://github.com/skorotkiewicz/los-cara#limitations">Read the limitations ↗</a>
+        </article>
+        <!-- <article>
+          <span class="label">The family history</span>
+          <h3>Blame the television.</h3>
+          <p>The name came from watching <cite>The Cleaning Lady</cite>: “Sin Cara” became “los-cara.” Then a Rust storage server moved into a home server and took MinIO's old job.</p>
+          <p>No cartel affiliation. Just someone watching TV and naming software.</p>
+        </article> -->
+      </section>
+    </main>
+    <footer>
+      <span><strong>los-cara</strong> / Small operation. Real objects.</span>
+      <a href="https://github.com/skorotkiewicz/los-cara">Source code, no secret handshake ↗</a>
+    </footer>
+  </div>
+</body>
+</html>

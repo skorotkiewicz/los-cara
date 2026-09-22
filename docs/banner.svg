@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="360" viewBox="0 0 1100 360" role="img" aria-labelledby="title description">
+  <title id="title">los-cara: A small storage operation.</title>
+  <desc id="description">A cream and orange banner with a bucket wearing sunglasses. S3-compatible object storage, written in Rust. Bring your own disk.</desc>
+  <rect width="1100" height="360" rx="16" fill="#f5f1e7"/>
+  <g font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" fill="#23251f">
+    <text x="56" y="58" font-family="monospace" font-size="13" letter-spacing="2" fill="#bd3a17">RUST-BUILT. HOME-SERVER APPROVED.</text>
+    <text x="50" y="154" font-size="88" font-weight="900" letter-spacing="-5">los-cara<tspan fill="#bd3a17">.</tspan></text>
+    <text x="56" y="205" font-size="30" font-weight="650">A small storage operation.</text>
+    <text x="56" y="244" font-size="18" fill="#595c50">S3-compatible object storage. Bring your own disk.</text>
+    <path d="M56 275h615" stroke="#c6c6b6"/>
+    <text x="56" y="308" font-family="monospace" font-size="14" fill="#595c50">ONE BINARY / YOUR DISKS / NO EXTERNAL DATABASE</text>
+  </g>
+  <g transform="translate(735 15)">
+    <ellipse cx="160" cy="304" rx="115" ry="12" fill="#dedecf"/>
+    <path d="M85 99V79a75 75 0 0 1 150 0v20" fill="none" stroke="#23251f" stroke-width="12"/>
+    <path d="M41 105h238l-28 175q-91 32-182 0Z" fill="#d95127" stroke="#23251f" stroke-width="5" stroke-linejoin="round"/>
+    <ellipse cx="160" cy="105" rx="119" ry="25" fill="#ef8758" stroke="#23251f" stroke-width="5"/>
+    <path d="M65 152h73l-5 38q-32 13-62-4Zm117 0h73l-6 34q-30 17-62 4Z" fill="#23251f"/>
+    <path d="M137 160q23-12 47 0M62 151l-12-7m204 7 15-7" fill="none" stroke="#23251f" stroke-width="7"/>
+    <path d="M98 159h18m84 0h18" stroke="#f5f1e7" stroke-width="5" stroke-linecap="round"/>
+    <path d="M143 213q18 13 36-1" fill="none" stroke="#23251f" stroke-width="5" stroke-linecap="round"/>
+    <g transform="rotate(-5 160 260)">
+      <rect x="115" y="243" width="90" height="35" rx="2" fill="#f5f1e7"/>
+      <text x="160" y="267" text-anchor="middle" fill="#23251f" font-family="monospace" font-size="22" font-weight="bold">lc</text>
+    </g>
+  </g>
+</svg>

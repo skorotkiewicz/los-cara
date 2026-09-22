@@ -1,4 +1,11 @@
+![los-cara: A small storage operation. An orange bucket wearing sunglasses.](docs/banner.svg)
+
 # los-cara
+
+[![Build](https://github.com/skorotkiewicz/los-cara/actions/workflows/build.yml/badge.svg)](https://github.com/skorotkiewicz/los-cara/actions/workflows/build.yml)
+[![Latest release](https://img.shields.io/github/v/release/skorotkiewicz/los-cara?color=bd3a17)](https://github.com/skorotkiewicz/los-cara/releases)
+[![Written in Rust](https://img.shields.io/badge/written_in-Rust-bd3a17?logo=rust)](https://www.rust-lang.org/)
+[![S3 compatible](https://img.shields.io/badge/API-S3_compatible-596747)](#supported-operations)
 
 An S3-compatible object storage server written in Rust. Point any standard S3
 client (AWS SDKs, AWS CLI, rclone, s5cmd, MinIO clients) at it and store data.
